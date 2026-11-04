@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>struIDEl · Visual Stage</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #050505;
+      color: #d0d0d0;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+    }
+    #hydra-canvas, canvas {
+      position: fixed !important;
+      inset: 0 !important;
+      width: 100vw !important;
+      height: 100vh !important;
+      display: block;
+      z-index: 0;
+    }
+    #hud {
+      position: fixed;
+      left: 16px;
+      bottom: 16px;
+      z-index: 2;
+      pointer-events: none;
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      text-shadow: 0 1px 10px #000, 0 0 20px #000;
+      opacity: 0.9;
+      line-height: 1.45;
+    }
+    #hud strong { color: #fff; }
+    #badge {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      right: 16px;
+      z-index: 2;
+      pointer-events: none;
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      text-shadow: 0 1px 10px #000;
+      opacity: 0.75;
+    }
+    #badge .hint {
+      display: block;
+      margin-top: 6px;
+      font-size: 10px;
+      letter-spacing: 0.06em;
+      text-transform: none;
+      opacity: 0.65;
+    }
+    #hydra-panel {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      top: 72px;
+      width: min(42vw, 480px);
+      z-index: 2;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      pointer-events: none;
+      opacity: 0.92;
+    }
+    #hydra-panel.hidden { display: none; }
+    #hydra-panel .panel-head {
+      font-size: 10px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      text-shadow: 0 1px 10px #000;
+      opacity: 0.8;
+    }
+    #hydra-panel .panel-head strong { color: #fff; }
+    #bus-live {
+      font-size: 10px;
+      line-height: 1.4;
+      color: #b8b8b8;
+      text-shadow: 0 1px 8px #000;
+      white-space: pre-wrap;
+      background: rgba(0, 0, 0, 0.45);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      padding: 8px 10px;
+    }
+    #hydra-code {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      margin: 0;
+      padding: 10px 12px;
+      font-size: 11px;
+      line-height: 1.45;
+      color: #e8e8e8;
+      background: rgba(0, 0, 0, 0.55);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      white-space: pre;
+      text-shadow: none;
+      scrollbar-width: thin;
+    }
+  </style>
+</head>
+<body>
+  <div id="badge">
+    Hydra · Visual Stage
+    <span class="hint">IDE Hydra panel: edit + Eval · C code · 1–N looks · N next · B branch · A auto</span>
+  </div>
+  <div id="hydra-panel">
+    <div class="panel-head">playing <strong id="code-title">—</strong></div>
+    <div id="bus-live">waiting for music…</div>
+    <pre id="hydra-code">// hydra sketch loads…</pre>
+  </div>
+  <div id="hud">
+    <div>look <strong id="patch">—</strong> <span id="credit"></span></div>
+    <div>WS <strong id="ws-state">connecting…</strong> · hit <strong id="hit">—</strong></div>
+    <div>dens <strong id="dens">0.00</strong> · hue <strong id="hue">0</strong></div>
+  </div>
+  <script src="https://unpkg.com/hydra-synth"></script>
+  <script src="./stage.js"></script>
+</body>
+</html>
