@@ -229,6 +229,28 @@ impl AudioRenderState {
                     if voice.cut > 0.0 {
                         self.voices.retain(|v| v.cut != voice.cut);
                     }
+                    // Garde-fou anti-empilement : un fichier long (> 3 s) retrigger
+                    // à chaque cycle s'empilerait sinon sur lui-même — prise voix,
+                    // boucle longue. Un nouveau déclenchement du MÊME sample long
+                    // remplace le précédent (auto-choke implicite). Les sons courts
+                    // (drums) gardent leur polyphonie, les samples différents
+                    // cohabitent, et `.cut(1)` reste disponible entre fichiers.
+                    const LONG_SAMPLE_SECS: f32 = 3.0;
+                    let dur_secs = voice.sample.data.len() as f32
+                        / voice.sample.channels.max(1) as f32
+                        / voice.sample.sample_rate.max(1) as f32;
+                    if dur_secs > LONG_SAMPLE_SECS {
+                        // Identité par pointeur OU empreinte (le reload après
+                        // eval recrée l'Arc du même fichier — le ptr_eq seul
+                        // raterait les voix de la génération précédente).
+                        self.voices.retain(|v| {
+                            let s = &v.sample;
+                            !Arc::ptr_eq(s, &voice.sample)
+                                && !(s.data.len() == voice.sample.data.len()
+                                    && s.channels == voice.sample.channels
+                                    && s.sample_rate == voice.sample.sample_rate)
+                        });
+                    }
                     // Plafond par sample : un s() retrigger chaque cycle sur un
                     // fichier long empile sinon des dizaines de voix identiques
                     // → le callback dépasse son budget et la carte son crache.
