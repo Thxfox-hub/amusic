@@ -235,6 +235,10 @@ pub struct StruidelApp {
     sample_browser_filter_key: (String, String),
     /// Recherche dans la palette « Sons » (à côté de Mixer).
     sound_palette_search: String,
+    /// Import de sons depuis un repo GitHub : URL saisie, état UI, canal thread.
+    github_import_url: String,
+    github_import_rx: Option<mpsc::Receiver<crate::github_samples::GithubImportEvent>>,
+    github_import_state: GithubImportUi,
     /// Состояние отладчика (брейкпоинты, вотчпоинты, кэтчпоинты).
     debugger: ui::DebuggerState,
     /// Состояние транспорта (BPM, шаг, реверс, петля).
@@ -369,6 +373,16 @@ enum SoundInsertMode {
     AtCursor,
     /// Ajoute le son comme nouvelle partie jouée en parallèle (`stack(…)`).
     NewPart,
+}
+
+/// État affiché de l'import GitHub dans l'onglet Sons.
+#[derive(Clone, Debug, Default)]
+enum GithubImportUi {
+    #[default]
+    Idle,
+    Running { files: usize, bytes: u64 },
+    Done { files: usize, bytes: u64 },
+    Error(String),
 }
 
 /// Ondes de synthèse et synthés composés jouables par le moteur natif.
@@ -849,6 +863,9 @@ impl StruidelApp {
             sample_browser_cache_pending: false,
             sample_browser_filtered_rows: None,
             sound_palette_search: String::new(),
+            github_import_url: String::new(),
+            github_import_rx: None,
+            github_import_state: GithubImportUi::Idle,
             sample_browser_filter_key: (String::new(), "all".to_string()),
             debugger: ui::DebuggerState::default(),
             transport_state: ui::TransportState::default(),
@@ -2101,6 +2118,62 @@ impl StruidelApp {
                 .small(),
         );
         ui.add_space(4.0);
+
+        // Import de sons depuis un dépôt GitHub (thread de fond + progression).
+        egui::CollapsingHeader::new("⬇Importer depuis GitHub")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.github_import_url)
+                            .hint_text("github.com/user/repo-de-sons")
+                            .desired_width(230.0),
+                    );
+                    let running = self.github_import_rx.is_some();
+                    if ui
+                        .add_enabled(!running, egui::Button::new("Importer"))
+                        .on_hover_text("Télécharge le tarball du repo et extrait les sons\n(wav/mp3/flac/ogg/… + manifestes json)")
+                        .clicked()
+                    {
+                        self.start_github_import();
+                    }
+                });
+                match &self.github_import_state {
+                    GithubImportUi::Running { files, bytes } => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "import… {} fichiers · {:.1} Mio",
+                                files,
+                                *bytes as f64 / 1_048_576.0
+                            ))
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                        );
+                    }
+                    GithubImportUi::Done { files, bytes } => {
+                        ui.colored_label(
+                            ui.visuals().hyperlink_color,
+                            format!(
+                                "✓ {} sons importés ({:.1} Mio) — rescannés dans la liste",
+                                files,
+                                *bytes as f64 / 1_048_576.0
+                            ),
+                        );
+                    }
+                    GithubImportUi::Error(e) => {
+                        ui.colored_label(ui.visuals().error_fg_color, format!("✗ {e}"));
+                    }
+                    GithubImportUi::Idle => {}
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "un dossier = une banque · strudel.json à la racine = banques nommées",
+                    )
+                    .color(ui.visuals().weak_text_color())
+                    .small(),
+                );
+            });
+        ui.add_space(4.0);
         self.live_params_ui(ui);
         ui.add_space(4.0);
 
@@ -2621,6 +2694,18 @@ impl StruidelApp {
             "audio_load": self.audio.as_ref().map(|e| e.load_snapshot()),
             "meter": meter,
             "last_error": self.bridge.last_error(),
+            "github_import": match &self.github_import_state {
+                GithubImportUi::Idle => serde_json::json!({"state": "idle"}),
+                GithubImportUi::Running { files, bytes } => serde_json::json!({
+                    "state": "running", "files": files, "bytes": bytes,
+                }),
+                GithubImportUi::Done { files, bytes } => serde_json::json!({
+                    "state": "done", "files": files, "bytes": bytes,
+                }),
+                GithubImportUi::Error(e) => serde_json::json!({
+                    "state": "error", "error": e,
+                }),
+            },
             "timeline": {
                 "clips": self.audio_project.tracks.iter().map(|t| t.clips.len()).sum::<usize>(),
                 "selected_clip": self.audio_project.selected_clip,
@@ -2681,6 +2766,19 @@ impl StruidelApp {
                 let root = PathBuf::from(&self.settings.sample_folder);
                 let by_bank = crate::sample_loader::available_sounds_by_bank(&root);
                 json!({"ok": true, "banks": by_bank})
+            }
+            // Démarre l'import d'un repo GitHub de sons (async — suivre via
+            // get_status → github_import).
+            "import_github" => {
+                let Some(url) = body.get("url").and_then(|u| u.as_str()) else {
+                    return json!({"ok": false, "error": "champ \"url\" manquant"});
+                };
+                if crate::github_samples::parse_github_url(url).is_none() {
+                    return json!({"ok": false, "error": "URL GitHub invalide"});
+                }
+                self.github_import_url = url.to_string();
+                self.start_github_import();
+                json!({"ok": true, "started": true})
             }
             "preview" => {
                 let name = body.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -4418,6 +4516,81 @@ impl StruidelApp {
                 self.chain_seed.phase = "1/2 Fetching".into();
                 self.chain_seed.status = "1/2 Fetching — starting…".into();
                 self.spawn_chain_seed_fetch(self.chain_seed.mode);
+            }
+        }
+    }
+
+    /// Lance l'import d'un repo GitHub de sons dans un thread de fond.
+    fn start_github_import(&mut self) {
+        let input = self.github_import_url.trim().to_string();
+        let Some(repo) = crate::github_samples::parse_github_url(&input) else {
+            self.github_import_state =
+                GithubImportUi::Error("URL invalide — ex. github.com/user/repo".to_string());
+            return;
+        };
+        if self.github_import_rx.is_some() {
+            return; // import déjà en cours
+        }
+        let (tx, rx) = mpsc::channel();
+        self.github_import_rx = Some(rx);
+        self.github_import_state = GithubImportUi::Running {
+            files: 0,
+            bytes: 0,
+        };
+        let dest_root = crate::paths::github_repos_root();
+        thread::spawn(move || {
+            let txp = tx.clone();
+            let result = crate::github_samples::import_repo(
+                &repo,
+                &dest_root,
+                &mut |p| {
+                    let _ = txp.send(crate::github_samples::GithubImportEvent::Progress {
+                        files: p.files,
+                        bytes: p.bytes,
+                    });
+                },
+            );
+            let _ = tx.send(crate::github_samples::GithubImportEvent::Done(result));
+        });
+    }
+
+    /// Draine les événements de l'import GitHub en cours.
+    fn poll_github_import(&mut self) {
+        let Some(rx) = self.github_import_rx.as_ref() else {
+            return;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(crate::github_samples::GithubImportEvent::Progress { files, bytes }) => {
+                    self.github_import_state = GithubImportUi::Running { files, bytes };
+                }
+                Ok(crate::github_samples::GithubImportEvent::Done(Ok(report))) => {
+                    self.github_import_rx = None;
+                    self.github_import_state = GithubImportUi::Done {
+                        files: report.files,
+                        bytes: report.bytes,
+                    };
+                    // Le repo est une nouvelle racine de samples : rescan complet.
+                    self.sample_browser_entries_cache = None;
+                    self.sample_browser_filtered_rows = None;
+                    self.sample_browser_cache_pending = true;
+                    if let Some(engine) = &self.audio {
+                        engine.reload_samples_async(Path::new(&self.settings.sample_folder));
+                    }
+                    break;
+                }
+                Ok(crate::github_samples::GithubImportEvent::Done(Err(e))) => {
+                    self.github_import_rx = None;
+                    self.github_import_state = GithubImportUi::Error(e);
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.github_import_rx = None;
+                    self.github_import_state =
+                        GithubImportUi::Error("thread d'import interrompue".to_string());
+                    break;
+                }
             }
         }
     }
@@ -6775,6 +6948,7 @@ impl eframe::App for StruidelApp {
         self.poll_clip_fx_renders();
         self.poll_control_api(ctx);
         self.poll_chain_seed_fetch();
+        self.poll_github_import();
         self.poll_ai_pattern();
         self.tick_chain_seed_live();
         // Если drag'n'drop больше не активен, сбрасываем информацию о перетаскиваемой вкладке.
@@ -6786,6 +6960,7 @@ impl eframe::App for StruidelApp {
         }
         if self.chain_seed.busy
             || self.ai_pattern.busy
+            || self.github_import_rx.is_some()
             || self.chain_seed.live_follow
             || (self.chain_seed.live_morph && self.playing)
         {

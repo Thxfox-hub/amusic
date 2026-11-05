@@ -376,6 +376,10 @@ struct AudioControlState {
     soundfont: Option<Arc<rustysynth::SoundFont>>,
     project_sources: HashMap<AudioSourceId, Arc<Sample>>,
     missing_logged: HashSet<SampleKey>,
+    /// Chemins dont le décodage a déjà échoué — évite de retenter et
+    /// re-logger à chaque trigger (un index peut référencer un fichier
+    /// disparu ou corrompu).
+    failed_paths: HashSet<PathBuf>,
     broken_project_sources: HashSet<AudioSourceId>,
 }
 
@@ -386,6 +390,7 @@ impl AudioControlState {
             soundfont: None,
             project_sources: HashMap::new(),
             missing_logged: HashSet::new(),
+            failed_paths: HashSet::new(),
             broken_project_sources: HashSet::new(),
         }
     }
@@ -1450,10 +1455,21 @@ impl AudioEngine {
                 }
             }
         };
+        {
+            let Ok(state) = self.control.lock() else {
+                return;
+            };
+            if state.failed_paths.contains(&path) {
+                return;
+            }
+        }
         let sample = match load_wav_sample(&path) {
             Ok(sample) => sample,
             Err(e) => {
                 eprintln!("[AudioEngine] failed to load {:?}: {}", path, e);
+                if let Ok(mut state) = self.control.lock() {
+                    state.failed_paths.insert(path);
+                }
                 return;
             }
         };
@@ -1546,6 +1562,7 @@ impl AudioEngine {
                     );
                     state.library = lib;
                     state.missing_logged.clear();
+                    state.failed_paths.clear();
                     if let Some(sf) = sf {
                         state.soundfont = Some(sf);
                     }
@@ -1702,6 +1719,7 @@ impl AudioEngine {
                         );
                         s.library = lib;
                         s.missing_logged.clear();
+                        s.failed_paths.clear();
                         if let Some(sf) = sf {
                             s.soundfont = Some(sf);
                         }

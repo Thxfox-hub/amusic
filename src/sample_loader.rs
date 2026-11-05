@@ -366,9 +366,20 @@ fn load_symphonia_sample(path: &Path) -> Result<Arc<Sample>, String> {
     }))
 }
 
-/// Список корней для загрузки сэмплов: основной + дополнительные из настроек IDE.
+/// Список корней для загрузки сэмплов: основной + repos GitHub importés
+/// (`<data>/repos/*`, un dossier = une racine) + dossiers supplémentaires
+/// des réglages IDE.
 pub fn sample_roots(main_root: &Path) -> Vec<PathBuf> {
     let mut roots = vec![main_root.to_path_buf()];
+    let repos_root = crate::paths::github_repos_root();
+    if let Ok(entries) = std::fs::read_dir(&repos_root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                roots.push(p);
+            }
+        }
+    }
     let extra = settings::load_settings()
         .extra_sample_folders
         .into_iter()
@@ -534,29 +545,53 @@ fn find_pack_dir(root: &Path, json_stem: &str, json: &Value) -> PathBuf {
     exact
 }
 
-/// Если первый семпл не найден прямо в `pack_dir`, проверяет один уровень
-/// поддиректорий (напр. `machines/` в tidal-drum-machines).
-fn detect_local_base(pack_dir: &Path, first_sample_path: &str) -> PathBuf {
-    let decoded = percent_decode(first_sample_path);
-    if pack_dir.join(&decoded).exists() {
+/// Sonde la meilleure base locale pour un manifeste : `pack_dir`, ses
+/// sous-répertoires, puis `manifest_dir` (racine du dépôt — les chemins des
+/// manifestes sont souvent relatifs à elle, ex. Dirt-Samples). Chaque base
+/// est notée par le nombre de chemins de `probes` qui y existent vraiment ;
+/// la première base avec le meilleur score gagne (égalité → priorité d'ordre).
+fn detect_local_base(
+    pack_dir: &Path,
+    manifest_dir: &Path,
+    probes: &[String],
+) -> PathBuf {
+    if probes.is_empty() {
         return pack_dir.to_path_buf();
     }
-    if let Ok(entries) = std::fs::read_dir(pack_dir) {
-        for entry in entries.flatten() {
-            if !entry.path().is_dir() {
-                continue;
-            }
-            if entry.path().join(&decoded).exists() {
-                return entry.path();
+    let mut bases: Vec<PathBuf> = vec![pack_dir.to_path_buf()];
+    if manifest_dir != pack_dir {
+        bases.push(manifest_dir.to_path_buf());
+    }
+    // Sous-répertoires directs de chaque base (ex. `machines/`).
+    for base in bases.clone() {
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    bases.push(p);
+                }
             }
         }
     }
-    pack_dir.to_path_buf()
+    let mut best: Option<(usize, PathBuf)> = None;
+    for base in bases {
+        let score = probes
+            .iter()
+            .filter(|p| base.join(percent_decode(p)).is_file())
+            .count();
+        if score == 0 {
+            continue;
+        }
+        if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            best = Some((score, base));
+        }
+    }
+    best.map(|(_, b)| b).unwrap_or_else(|| pack_dir.to_path_buf())
 }
 
 /// Extensions de fichiers audio que le loader sait décoder (WAV via le parseur
 /// maison, tout le reste via symphonia).
-fn is_audio_file(path: &Path) -> bool {
+pub(crate) fn is_audio_file(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(OsStr::to_str)
@@ -659,20 +694,21 @@ fn build_sample_index_from_manifests(root: &Path) -> HashMap<SampleKey, Vec<Path
             None => continue,
         };
 
-        let mut first_rel: Option<String> = None;
+        // Sondes : premier chemin de chaque clé (max 12) pour trouver la
+        // bonne base sans se fier à un seul fichier peut-être absent.
+        let mut probes: Vec<String> = Vec::new();
         for (key, value) in obj.iter() {
             if key.starts_with('_') {
                 continue;
             }
-            let paths = collect_rel_paths_from_value(value);
-            if first_rel.is_none() {
-                first_rel = paths.first().cloned();
+            if let Some(p) = collect_rel_paths_from_value(value).into_iter().next() {
+                probes.push(p);
+                if probes.len() >= 12 {
+                    break;
+                }
             }
         }
-        let local_base = match first_rel.as_deref() {
-            Some(p) => detect_local_base(&pack_dir, p),
-            None => pack_dir.clone(),
-        };
+        let local_base = detect_local_base(&pack_dir, root, &probes);
 
         for (key, value) in obj.iter() {
             if key.starts_with('_') {
@@ -682,7 +718,9 @@ fn build_sample_index_from_manifests(root: &Path) -> HashMap<SampleKey, Vec<Path
             let resolved: Vec<PathBuf> = rel_paths
                 .iter()
                 .map(|rp| local_base.join(percent_decode(rp)))
-                .filter(|p| is_audio_file(p))
+                // is_file() : un manifeste peut lister des fichiers absents
+                // (ex. pack partiel) — ne jamais indexer de chemin fantôme.
+                .filter(|p| p.is_file() && is_audio_file(p))
                 .collect();
             if resolved.is_empty() {
                 continue;

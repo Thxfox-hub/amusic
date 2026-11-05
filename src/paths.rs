@@ -244,6 +244,15 @@ pub fn default_sample_folder() -> PathBuf {
     PathBuf::from("struidel-samples")
 }
 
+/// Racine des dépôts GitHub importés : chaque repo = un sous-dossier
+/// `<owner>-<repo>/` scanné comme une racine de samples dédiée.
+pub fn github_repos_root() -> PathBuf {
+    if let Some(dirs) = directories::ProjectDirs::from("cc", "strudel", "struidel") {
+        return dirs.data_local_dir().join("repos");
+    }
+    PathBuf::from("struidel-repos")
+}
+
 /// Cache file for the language index (XDG cache).
 pub fn language_index_cache_path() -> PathBuf {
     if let Some(dirs) = directories::ProjectDirs::from("cc", "strudel", "struidel") {

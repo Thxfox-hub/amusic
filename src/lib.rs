@@ -9,6 +9,7 @@ pub mod audio_recording;
 pub mod chain_seed;
 pub mod code_visuals;
 pub mod doc_json;
+pub mod github_samples;
 pub mod mini_notation;
 pub mod mixer_dsp;
 pub mod native_engine;
