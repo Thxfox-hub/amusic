@@ -794,8 +794,12 @@ impl AudioEngine {
                 mono /= channels_in as f32;
                 let shape = v.shape.clamp(0.0, 1.0);
                 if shape > 0.0 {
+                    // Saturateur : les crêtes butent sur un plafond fixe 0.7 au
+                    // lieu d'être normalisées vers le bas — le « grain » reste
+                    // audible et le niveau ne s'écroule pas (le /drive précédent
+                    // rendait l'effet « juste moins fort »).
                     let drive = 1.0 + shape * 12.0;
-                    mono = (mono * drive).tanh() / drive;
+                    mono = (mono * drive).tanh() * 0.7;
                 }
                 // `v.cut` est un identifiant de groupe de coupure (géré à
                 // l'ajout de la voix), pas un atténuateur — rien à faire ici.
@@ -825,6 +829,9 @@ impl AudioEngine {
                 }
                 // `.compressor(seuilDb).compressorRatio(r)` — env suiveur de
                 // crête (release ~30 ms) puis réduction au-dessus du seuil.
+                // Makeup 50 % : la moitié de la réduction est rendue — sinon
+                // sur une prise calme tout dépasse le seuil et l'effet devient
+                // un simple bouton de volume.
                 if v.comp_ratio > 1.0 {
                     let a = mono.abs();
                     v.comp_env = a.max(v.comp_env * (1.0 - 1.4e-3));
@@ -832,7 +839,7 @@ impl AudioEngine {
                         let env_db = 20.0 * v.comp_env.log10();
                         if env_db > v.comp_thresh_db {
                             let excess = env_db - v.comp_thresh_db;
-                            mono *= 10f32.powf(-excess * (1.0 - 1.0 / v.comp_ratio) / 20.0);
+                            mono *= 10f32.powf(-excess * (1.0 - 1.0 / v.comp_ratio) * 0.5 / 20.0);
                         }
                     }
                 }
