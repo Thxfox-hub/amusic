@@ -7,6 +7,7 @@ pub mod audio_clip_engine;
 pub mod audio_dsp;
 pub mod audio_recording;
 pub mod chain_seed;
+pub mod code_visuals;
 pub mod doc_json;
 pub mod mini_notation;
 pub mod mixer_dsp;

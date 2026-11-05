@@ -1363,6 +1363,7 @@ impl EditorTab {
         debugger: Option<&DebuggerState>,
         example_playback: &ExamplePlaybackState,
         example_playing_events: &[ActiveSampleEvent],
+        visuals: Option<&crate::code_visuals::VisualsData>,
     ) -> Vec<EditorAction> {
         let mut editor_actions = Vec::new();
         let completion_was_open = self.completion.is_some();
@@ -1376,10 +1377,28 @@ impl EditorTab {
         let viewport_rect = egui::Rect::from_min_size(available.min, available.size());
         let find_visible = self.find_replace.visible;
         let find_panel_h = if find_visible { FIND_PANEL_H } else { 0.0 };
+        // Directives visuelles `._xxx()` / `.xxx()` dans le code → bande en bas.
+        let visual_directives = crate::code_visuals::parse_visual_directives(&self.code);
+        let strip_h = if visual_directives.is_empty() {
+            0.0
+        } else {
+            crate::ui::VISUAL_STRIP_H
+        };
         let editor_viewport_rect = egui::Rect::from_min_max(
             viewport_rect.min,
-            egui::pos2(viewport_rect.max.x, viewport_rect.max.y - find_panel_h),
+            egui::pos2(
+                viewport_rect.max.x,
+                viewport_rect.max.y - find_panel_h - strip_h,
+            ),
         );
+        let visuals_rect = if strip_h > 0.0 {
+            Some(egui::Rect::from_min_max(
+                egui::pos2(viewport_rect.min.x, editor_viewport_rect.max.y),
+                egui::pos2(viewport_rect.max.x, editor_viewport_rect.max.y + strip_h),
+            ))
+        } else {
+            None
+        };
 
         let ctrl_space = ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Space));
         let ctrl_escape = ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Escape));
@@ -1479,7 +1498,7 @@ impl EditorTab {
             editor_viewport_rect.max,
         );
         let find_panel_rect = egui::Rect::from_min_max(
-            egui::pos2(viewport_rect.min.x, editor_viewport_rect.max.y),
+            egui::pos2(viewport_rect.min.x, viewport_rect.max.y - find_panel_h),
             viewport_rect.max,
         );
 
@@ -2941,6 +2960,15 @@ impl EditorTab {
             example_playback,
         ) {
             editor_actions.push(EditorAction::StopExample);
+        }
+
+        // Bande de visuels `._xxx()` sous le code (comme strudel.cc).
+        if let Some(vrect) = visuals_rect {
+            if vrect.height() > 1.0 {
+                ui.allocate_ui_at_rect(vrect, |ui| {
+                    crate::ui::visuals_strip_ui(ui, &self.code, visuals);
+                });
+            }
         }
 
         editor_actions

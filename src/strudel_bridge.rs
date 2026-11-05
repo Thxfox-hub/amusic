@@ -1029,6 +1029,9 @@ impl StrudelBridge {
         if let Ok(mut s) = self.state.lock() {
             s.eval_epoch = s.eval_epoch.wrapping_add(1);
         }
+        // Les directives visuelles `._scope()`/`.xxx()` sont display-only :
+        // superdough ne les connaît pas → on les retire avant l'eval Node.
+        let code = crate::code_visuals::strip_visual_directives(code);
         if let Some(ref tx) = self.tx {
             tx.send(NodeCommand::Eval {
                 code: code.to_string(),

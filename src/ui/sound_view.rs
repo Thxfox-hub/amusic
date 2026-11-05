@@ -42,9 +42,6 @@ pub struct SoundViewState {
     pub mode: SoundViewMode,
     fft: Option<Arc<dyn Fft<f32>>>,
     fft_buf: Vec<Complex<f32>>,
-    /// Accumule les échantillons drainés du tap entre les frames (~800/frame
-    /// à 60 fps — un drain(8192) viderait la file et affamerait la FFT).
-    spectrum_buf: std::collections::VecDeque<f32>,
 }
 
 impl SoundViewState {
@@ -393,19 +390,12 @@ fn spectrum_view(ui: &mut Ui, state: &mut SoundViewState, audio: Option<&Arc<Aud
         return;
     };
     let tap = engine.spectrum_tap();
-    // ~44 kHz max → ~750 échantillons/frame à 60 fps. On draine le surplus
-    // et on garde une fenêtre glissante de 4096 dans spectrum_buf.
-    let incoming = tap.drain(8192);
-    state.spectrum_buf.extend(incoming);
-    while state.spectrum_buf.len() > 4096 {
-        state.spectrum_buf.pop_front();
-    }
-    if state.spectrum_buf.len() < 2048 {
+    // Fenêtre glissante non destructive : les 2048 plus récents post-master.
+    let samples = tap.recent(2048);
+    if samples.len() < 2048 {
         ui.label("Pas assez de signal — joue quelque chose.");
         return;
     }
-    let mut samples: Vec<f32> = state.spectrum_buf.iter().copied().collect();
-    samples = samples.split_off(samples.len() - 2048);
 
     // Fenêtrage Hann + FFT.
     let n = samples.len();

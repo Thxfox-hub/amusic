@@ -4,6 +4,7 @@ mod ai_pattern;
 mod arrangement_view;
 mod audio_timeline;
 mod chain_seed;
+mod code_visuals_view;
 mod debugger;
 mod editor_tab;
 mod file_tree;
@@ -20,6 +21,7 @@ pub use arrangement_view::{
 };
 pub use audio_timeline::{audio_timeline_ui, AudioTimelineAction, AudioTimelineViewState};
 pub use chain_seed::{chain_seed_ui, ChainSeedAction};
+pub use code_visuals_view::{visuals_strip_ui, VISUAL_STRIP_H};
 pub use hydra_studio::{hydra_studio_ui, HydraAction, HydraStudioState, HYDRA_PRESETS};
 pub use debugger::{
     debugger_ui, CatchpointKind, DebuggerAction, DebuggerState, SourceBreakpointKey,

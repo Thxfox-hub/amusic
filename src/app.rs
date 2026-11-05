@@ -1303,6 +1303,17 @@ impl StruidelApp {
             ui.allocate_ui_at_rect(content_rect, |ui| {
                 if let Some(editor) = self.editor_tabs.get_mut(idx) {
                     let before = editor.code.clone();
+                    let visuals_data = crate::code_visuals::VisualsData {
+                        spectrum: self.audio.as_ref().map(|a| a.spectrum_tap()),
+                        doc: self.pattern_document.as_ref(),
+                        current_cycle: self.current_time,
+                        playing: self.playing,
+                        sample_rate_hz: self
+                            .audio
+                            .as_ref()
+                            .map(|a| a.sample_rate())
+                            .unwrap_or(48_000) as f32,
+                    };
                     let actions = editor.ui(
                         ui,
                         &self.settings,
@@ -1312,6 +1323,7 @@ impl StruidelApp {
                         Some(&self.debugger),
                         &self.example_playback,
                         &example_playing_events,
+                        Some(&visuals_data),
                     );
                     editor_debug_actions.extend(actions);
                     if editor.code != before {

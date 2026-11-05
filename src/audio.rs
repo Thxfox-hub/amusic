@@ -248,12 +248,14 @@ impl SpectrumTap {
         }
     }
 
-    /// Draine jusqu'à `n` échantillons (les plus anciens d'abord).
-    pub fn drain(&self, n: usize) -> Vec<f32> {
+    /// Fenêtre glissante : les `n` échantillons les plus récents, dans
+    /// l'ordre. Non destructif — plusieurs vues (scope, spectre…) peuvent
+    /// lire la même fenêtre sans se voler les données.
+    pub fn recent(&self, n: usize) -> Vec<f32> {
         match self.samples.lock() {
-            Ok(mut q) => {
-                let take = n.min(q.len());
-                q.drain(..take).collect()
+            Ok(q) => {
+                let start = q.len().saturating_sub(n);
+                q.iter().skip(start).copied().collect()
             }
             Err(_) => Vec::new(),
         }
@@ -2596,11 +2598,13 @@ mod spectrum_tap_tests {
     use super::SpectrumTap;
 
     #[test]
-    fn push_drain_roundtrip() {
+    fn recent_returns_newest_window() {
         let tap = SpectrumTap::default();
         tap.push(&[0.1, 0.2, 0.3]);
-        assert_eq!(tap.drain(10), vec![0.1, 0.2, 0.3]);
-        assert!(tap.drain(10).is_empty());
+        assert_eq!(tap.recent(10), vec![0.1, 0.2, 0.3]);
+        assert_eq!(tap.recent(2), vec![0.2, 0.3]);
+        // Non destructif : une seconde lecture voit la même fenêtre.
+        assert_eq!(tap.recent(3), vec![0.1, 0.2, 0.3]);
     }
 
     #[test]
@@ -2608,7 +2612,7 @@ mod spectrum_tap_tests {
         let tap = SpectrumTap::default();
         tap.push(&vec![0.5; SpectrumTap::CAP]);
         tap.push(&[0.9, 0.9]);
-        let out = tap.drain(SpectrumTap::CAP + 10);
+        let out = tap.recent(SpectrumTap::CAP + 10);
         assert_eq!(out.len(), SpectrumTap::CAP);
         assert_eq!(out[0], 0.5);
         assert_eq!(out[out.len() - 1], 0.9);
