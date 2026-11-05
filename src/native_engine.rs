@@ -98,6 +98,7 @@ impl NativeEngine {
                                 release: None,
                                 speed: None,
                                 cutoff: None,
+                                hcutoff: None,
                             }),
                         }
                     }

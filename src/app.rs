@@ -761,6 +761,7 @@ impl StruidelApp {
                             cut: ev.cut,
                             speed: ev.speed,
                             cutoff: ev.cutoff,
+                            hcutoff: ev.hcutoff,
                         });
                     }
                 });
@@ -1586,6 +1587,7 @@ impl StruidelApp {
                             cut: ev.cut,
                             speed: ev.speed,
                             cutoff: ev.cutoff,
+                            hcutoff: ev.hcutoff,
                         }
                     };
                     let (gm_events, other_events): (Vec<_>, Vec<_>) = result

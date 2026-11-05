@@ -101,6 +101,8 @@ pub struct AudioEvent {
     pub speed: Option<f64>,
     /// Fréquence de coupure du passe-bas (`.lpf()`) en Hz ; absent/0 = pas de filtre.
     pub cutoff: Option<f64>,
+    /// Fréquence de coupure du passe-haut (`.hpf()`) en Hz ; absent/0 = pas de filtre.
+    pub hcutoff: Option<f64>,
 }
 
 /// Параметры для отложенного рендера GM-ноты (вне блокировки state).
@@ -144,6 +146,9 @@ struct Voice {
     /// Passe-bas par voix (Hz) ; 0 = inactif. `lp_state` = mémoire du filtre un pôle.
     pub cutoff_hz: f32,
     pub lp_state: f32,
+    /// Passe-haut par voix (Hz) ; 0 = inactif. `hp_state` = mémoire du filtre.
+    pub hcutoff_hz: f32,
+    pub hp_state: f32,
 }
 
 /// Параметры эффектов по умолчанию (0 = без огибающей/реверба).
@@ -727,6 +732,11 @@ impl AudioEngine {
                     v.lp_state += alpha * (mono - v.lp_state);
                     mono = v.lp_state;
                 }
+                if v.hcutoff_hz > 0.0 {
+                    let alpha = crate::mixer_dsp::one_pole_alpha(sr, v.hcutoff_hz);
+                    v.hp_state += alpha * (mono - v.hp_state);
+                    mono -= v.hp_state;
+                }
 
                 let env = envelope(
                     v.attack,
@@ -1085,6 +1095,8 @@ impl AudioEngine {
             shape,
             cutoff_hz: 0.0,
             lp_state: 0.0,
+            hcutoff_hz: 0.0,
+            hp_state: 0.0,
         })
     }
 
@@ -1132,7 +1144,7 @@ impl AudioEngine {
                     ev_cut(&event),
                     ev_shape(&event),
                 ) {
-                    self.enqueue_voice(with_cutoff(with_speed(voice, event.speed), event.cutoff));
+                    self.enqueue_voice(with_hcutoff(with_cutoff(with_speed(voice, event.speed), event.cutoff), event.hcutoff));
                 }
             }
             return;
@@ -1159,7 +1171,7 @@ impl AudioEngine {
                 ev_cut(&event),
                 ev_shape(&event),
             ) {
-                self.enqueue_voice(with_cutoff(with_speed(voice, event.speed), event.cutoff));
+                self.enqueue_voice(with_hcutoff(with_cutoff(with_speed(voice, event.speed), event.cutoff), event.hcutoff));
             }
             return;
         }
@@ -1214,7 +1226,7 @@ impl AudioEngine {
                         params.cut,
                         params.shape,
                     ) {
-                        self.enqueue_voice(with_cutoff(with_speed(voice, event.speed), event.cutoff));
+                        self.enqueue_voice(with_hcutoff(with_cutoff(with_speed(voice, event.speed), event.cutoff), event.hcutoff));
                     }
                 }
                 return;
@@ -1265,7 +1277,7 @@ impl AudioEngine {
             ev_cut(&event),
             ev_shape(&event),
         ) {
-            self.enqueue_voice(with_cutoff(with_speed(voice, event.speed), event.cutoff));
+            self.enqueue_voice(with_hcutoff(with_cutoff(with_speed(voice, event.speed), event.cutoff), event.hcutoff));
         }
     }
 
@@ -2031,6 +2043,12 @@ fn with_speed(mut voice: Voice, speed: Option<f64>) -> Voice {
     voice
 }
 
+/// Applique `.hpf(…)` (hcutoff en Hz) à une voix : passe-haut un pôle (signal − passe-bas).
+fn with_hcutoff(mut voice: Voice, hcutoff: Option<f64>) -> Voice {
+    voice.hcutoff_hz = hcutoff.filter(|c| c.is_finite() && *c > 0.0).unwrap_or(0.0) as f32;
+    voice
+}
+
 /// Applique `.lpf(…)` (cutoff en Hz) à une voix : filtre passe-bas un pôle ; absent/0 = aucun.
 fn with_cutoff(mut voice: Voice, cutoff: Option<f64>) -> Voice {
     voice.cutoff_hz = cutoff.filter(|c| c.is_finite() && *c > 0.0).unwrap_or(0.0) as f32;
@@ -2369,6 +2387,8 @@ mod speed_tests {
             shape: 0.0,
             cutoff_hz: 0.0,
             lp_state: 0.0,
+            hcutoff_hz: 0.0,
+            hp_state: 0.0,
         }
     }
 

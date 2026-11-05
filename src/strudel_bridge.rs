@@ -136,6 +136,8 @@ struct SerdeAudioValue {
     speed: Option<f64>,
     #[serde(default)]
     cutoff: Option<f64>,
+    #[serde(default)]
+    hcutoff: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -166,6 +168,7 @@ pub struct StrudelAudioEvent {
     pub release: Option<f64>,
     pub speed: Option<f64>,
     pub cutoff: Option<f64>,
+    pub hcutoff: Option<f64>,
 }
 
 pub struct AudioWindowResult {
@@ -483,6 +486,7 @@ fn run_worker(
                                                 release: None,
                                                 speed: None,
                                                 cutoff: None,
+                                                hcutoff: None,
                                             });
                                             StrudelAudioEvent {
                                                 begin: e.begin,
@@ -503,6 +507,7 @@ fn run_worker(
                                                 release: v.release,
                                                 speed: v.speed,
                                                 cutoff: v.cutoff,
+                                                hcutoff: v.hcutoff,
                                             }
                                         })
                                         .collect();
