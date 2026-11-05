@@ -1847,6 +1847,7 @@ dependencies = [
  "hound",
  "reqwest",
  "rfd",
+ "rustfft",
  "rustysynth",
  "serde",
  "serde_json",

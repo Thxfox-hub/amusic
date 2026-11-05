@@ -10,6 +10,7 @@ mod file_tree;
 mod hydra_studio;
 mod mixer;
 mod settings_view;
+mod sound_view;
 mod timeline;
 mod transport;
 
@@ -30,6 +31,7 @@ pub use editor_tab::{
 pub use file_tree::FileTree;
 pub use mixer::mixer_ui;
 pub use settings_view::settings_ui;
+pub use sound_view::{sound_view_ui, SoundViewMode, SoundViewState};
 pub use timeline::{pattern_timeline_ui, PatternWaveformLookup, TimelineAction, TimelineViewState};
 pub use transport::{transport_ui, PlaybackSource, TransportAction, TransportState};
 

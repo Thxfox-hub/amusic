@@ -40,6 +40,8 @@ pub enum ContentId {
     Hydra,
     /// Local Ollama → Strudel pattern (no Hydra / no chain).
     AiPattern,
+    /// Vues du son : rythme du pattern, ondes des samples, spectre live.
+    SoundView,
 }
 
 impl ContentId {
@@ -62,6 +64,7 @@ impl ContentId {
             ContentId::ChainSeed => "Chain Seed",
             ContentId::Hydra => "Hydra",
             ContentId::AiPattern => "AI Pattern",
+            ContentId::SoundView => "Vue",
         }
     }
 
@@ -85,6 +88,7 @@ impl ContentId {
             ContentId::ChainSeed => "ChainSeed",
             ContentId::Hydra => "Hydra",
             ContentId::AiPattern => "AiPattern",
+            ContentId::SoundView => "SoundView",
         }
     }
 
@@ -109,6 +113,7 @@ impl ContentId {
             "ChainSeed" => Some(ContentId::ChainSeed),
             "Hydra" => Some(ContentId::Hydra),
             "AiPattern" => Some(ContentId::AiPattern),
+            "SoundView" => Some(ContentId::SoundView),
             _ => None,
         }
     }
@@ -196,6 +201,7 @@ impl LayoutNode {
                     ContentId::Timeline,
                     ContentId::Mixer,
                     ContentId::SoundPalette,
+                    ContentId::SoundView,
                 ])),
             }),
         }

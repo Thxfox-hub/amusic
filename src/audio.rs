@@ -224,10 +224,48 @@ pub struct AudioLoadStats {
     pub buffer_frames: AtomicU64,
 }
 
+/// Tap spectre live : le callback audio pousse le mix mono post-master
+/// (try_lock — jamais de blocage RT) ; l'UI draine et fait la FFT.
+#[derive(Default)]
+pub struct SpectrumTap {
+    samples: Mutex<std::collections::VecDeque<f32>>,
+}
+
+impl SpectrumTap {
+    const CAP: usize = 16384;
+
+    pub fn push(&self, chunk: &[f32]) {
+        if chunk.is_empty() {
+            return;
+        }
+        if let Ok(mut q) = self.samples.try_lock() {
+            let overflow = (q.len() + chunk.len()).saturating_sub(Self::CAP);
+            if overflow > 0 {
+                let drop_n = overflow.min(q.len());
+                q.drain(..drop_n);
+            }
+            q.extend(chunk.iter().copied());
+        }
+    }
+
+    /// Draine jusqu'à `n` échantillons (les plus anciens d'abord).
+    pub fn drain(&self, n: usize) -> Vec<f32> {
+        match self.samples.lock() {
+            Ok(mut q) => {
+                let take = n.min(q.len());
+                q.drain(..take).collect()
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
 struct AudioRenderState {
     sample_rate: f32,
     sample_clock: u64,
     voices: Vec<Voice>,
+    spectrum: Option<Arc<SpectrumTap>>,
+    spectrum_scratch: Vec<f32>,
     master_processor: InsertProcessor,
     daw_processors: Vec<InsertProcessor>,
     /// Простой реверб: два кольцевых буфера (L/R), задержка ~40 ms.
@@ -237,12 +275,14 @@ struct AudioRenderState {
 }
 
 impl AudioRenderState {
-    fn new(sample_rate: f32) -> Self {
+    fn new(sample_rate: f32, spectrum: Option<Arc<SpectrumTap>>) -> Self {
         let reverb_len = (0.04 * sample_rate).ceil() as usize;
         Self {
             sample_rate,
             sample_clock: 0,
             voices: Vec::with_capacity(MAX_VOICES),
+            spectrum,
+            spectrum_scratch: Vec::with_capacity(4096),
             master_processor: InsertProcessor::default(),
             daw_processors: (0..MAX_LIVE_DAW_CHANNELS)
                 .map(|_| InsertProcessor::default())
@@ -364,6 +404,8 @@ pub struct AudioEngine {
     stream_errors: Arc<AtomicU64>,
     /// Charge temps réel du callback (voix, durée) — exposée dans le status.
     load_stats: Arc<AudioLoadStats>,
+    /// Tap spectre live pour l'onglet « Vue » (mono post-master).
+    spectrum: Arc<SpectrumTap>,
     _stream: cpal::Stream,
 }
 
@@ -593,6 +635,7 @@ impl AudioEngine {
 
         let stream_errors = Arc::new(AtomicU64::new(0));
         let load_stats = Arc::new(AudioLoadStats::default());
+        let spectrum = Arc::new(SpectrumTap::default());
         let stream = match supported_config.sample_format() {
             cpal::SampleFormat::F32 => Self::build_output_stream::<f32>(
                 &device,
@@ -608,6 +651,7 @@ impl AudioEngine {
                 Arc::clone(&daw_meters),
                 Arc::clone(&stream_errors),
                 Arc::clone(&load_stats),
+                Arc::clone(&spectrum),
             )?,
             cpal::SampleFormat::I16 => Self::build_output_stream::<i16>(
                 &device,
@@ -623,6 +667,7 @@ impl AudioEngine {
                 Arc::clone(&daw_meters),
                 Arc::clone(&stream_errors),
                 Arc::clone(&load_stats),
+                Arc::clone(&spectrum),
             )?,
             cpal::SampleFormat::U16 => Self::build_output_stream::<u16>(
                 &device,
@@ -638,6 +683,7 @@ impl AudioEngine {
                 Arc::clone(&daw_meters),
                 Arc::clone(&stream_errors),
                 Arc::clone(&load_stats),
+                Arc::clone(&spectrum),
             )?,
             other => return Err(format!("Unsupported sample format: {other:?}")),
         };
@@ -651,6 +697,7 @@ impl AudioEngine {
             command_tx,
             stream_errors,
             load_stats,
+            spectrum,
             sample_clock,
             sample_rate,
             mixer,
@@ -676,6 +723,7 @@ impl AudioEngine {
         daw_meters: Arc<Vec<MeterAtomics>>,
         stream_errors: Arc<AtomicU64>,
         load_stats: Arc<AudioLoadStats>,
+        spectrum: Arc<SpectrumTap>,
     ) -> Result<cpal::Stream, String>
     where
         T: CpalSample + SizedSample + FromSample<f32>,
@@ -694,7 +742,7 @@ impl AudioEngine {
                 std::thread::sleep(std::time::Duration::from_millis(backoff));
             }
         };
-        let mut render_state = AudioRenderState::new(sample_rate);
+        let mut render_state = AudioRenderState::new(sample_rate, Some(Arc::clone(&spectrum)));
         device
             .build_output_stream(
                 config,
@@ -931,6 +979,9 @@ impl AudioEngine {
             let l = soft_clip(left);
             let r = soft_clip(right);
             meter.add_pair(l, r);
+            if render_state.spectrum.is_some() {
+                render_state.spectrum_scratch.push((l + r) * 0.5);
+            }
 
             if channels == 1 {
                 let mono = (l + r) * 0.5;
@@ -950,6 +1001,10 @@ impl AudioEngine {
                     *ch = T::from_sample((l + r) * 0.5);
                 }
             }
+        }
+        if let Some(tap) = &render_state.spectrum {
+            tap.push(&render_state.spectrum_scratch);
+            render_state.spectrum_scratch.clear();
         }
         sample_clock.store(render_state.sample_clock, Ordering::Relaxed);
         master_meter.store(meter.finish(previous_hold));
@@ -1143,6 +1198,16 @@ impl AudioEngine {
 
     pub fn master_meter(&self) -> MeterState {
         self.master_meter.load()
+    }
+
+    /// Tap spectre live (onglet « Vue ») — mono post-master, ~44 kHz max.
+    pub fn spectrum_tap(&self) -> Arc<SpectrumTap> {
+        Arc::clone(&self.spectrum)
+    }
+
+    /// Fréquence d'échantillonnage du flux de sortie (pour les échelles freq).
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate as u32
     }
 
     pub fn daw_meters(&self) -> Vec<(MixerChannelId, MeterState)> {
@@ -2527,6 +2592,30 @@ mod preview_tests {
 }
 
 #[cfg(test)]
+mod spectrum_tap_tests {
+    use super::SpectrumTap;
+
+    #[test]
+    fn push_drain_roundtrip() {
+        let tap = SpectrumTap::default();
+        tap.push(&[0.1, 0.2, 0.3]);
+        assert_eq!(tap.drain(10), vec![0.1, 0.2, 0.3]);
+        assert!(tap.drain(10).is_empty());
+    }
+
+    #[test]
+    fn capacity_drops_oldest() {
+        let tap = SpectrumTap::default();
+        tap.push(&vec![0.5; SpectrumTap::CAP]);
+        tap.push(&[0.9, 0.9]);
+        let out = tap.drain(SpectrumTap::CAP + 10);
+        assert_eq!(out.len(), SpectrumTap::CAP);
+        assert_eq!(out[0], 0.5);
+        assert_eq!(out[out.len() - 1], 0.9);
+    }
+}
+
+#[cfg(test)]
 mod speed_tests {
     use super::*;
 
@@ -2575,7 +2664,7 @@ mod speed_tests {
 
     #[test]
     fn full_voice_list_drops_oldest_not_newest() {
-        let mut state = AudioRenderState::new(48_000.0);
+        let mut state = AudioRenderState::new(48_000.0, None);
         for _ in 0..MAX_VOICES {
             state.voices.push(voice(1.0));
         }

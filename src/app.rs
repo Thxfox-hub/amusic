@@ -311,6 +311,8 @@ pub struct StruidelApp {
     hydra_studio: ui::HydraStudioState,
     /// Local Ollama → Strudel (separate from Chain Seed).
     ai_pattern: ui::AiPatternState,
+    /// Onglet « Vue » : rythme / onde / spectre du son.
+    sound_view: ui::SoundViewState,
     /// Background AI generate result.
     ai_pattern_rx: Option<mpsc::Receiver<Result<(String, u32, String), String>>>,
 }
@@ -901,6 +903,7 @@ impl StruidelApp {
                 ai.ollama_model = ollama_model;
                 ai
             },
+            sound_view: ui::SoundViewState::new(),
             ai_pattern_rx: None,
         }
     }
@@ -1734,7 +1737,20 @@ impl StruidelApp {
             ContentId::ChainSeed => self.chain_seed_content_ui(ui),
             ContentId::Hydra => self.hydra_content_ui(ui),
             ContentId::AiPattern => self.ai_pattern_content_ui(ui),
+            ContentId::SoundView => self.sound_view_content_ui(ui),
         }
+    }
+
+    /// Onglet « Vue » : rythme du pattern, ondes des samples, spectre live.
+    fn sound_view_content_ui(&mut self, ui: &mut egui::Ui) {
+        ui::sound_view_ui(
+            ui,
+            &mut self.sound_view,
+            self.pattern_document.as_ref(),
+            self.current_time,
+            self.playing,
+            self.audio.as_ref(),
+        );
     }
 
     /// Транспорт как полноценная вкладка рабочего пространства.
