@@ -99,6 +99,16 @@ impl NativeEngine {
                                 speed: None,
                                 cutoff: None,
                                 hcutoff: None,
+                                coarse: None,
+                                crush: None,
+                                compressor: None,
+                                compressor_ratio: None,
+                                penv: None,
+                                pattack: None,
+                                prelease: None,
+                                // Les patterns natifs sont sans FX — une époque
+                                // constante évite les remplacements inutiles.
+                                epoch: 0,
                             }),
                         }
                     }

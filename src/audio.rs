@@ -103,6 +103,23 @@ pub struct AudioEvent {
     pub cutoff: Option<f64>,
     /// Fréquence de coupure du passe-haut (`.hpf()`) en Hz ; absent/0 = pas de filtre.
     pub hcutoff: Option<f64>,
+    /// Décimation `.coarse(n)` : échantillonnage 1/n (bitcrush fréquentiel).
+    pub coarse: Option<f64>,
+    /// Quantification `.crush(bits)` : profondeur en bits (bitcrush amplitude).
+    pub crush: Option<f64>,
+    /// Seuil du compresseur en dB (`.compressor(-32)`).
+    pub compressor: Option<f64>,
+    /// Ratio du compresseur (`.compressorRatio(10)`).
+    pub compressor_ratio: Option<f64>,
+    /// Enveloppe de pitch en demi-tons (`.penv(3)`).
+    pub penv: Option<f64>,
+    /// Montée de l'enveloppe pitch en secondes (`.pattack(0.05)`).
+    pub pattack: Option<f64>,
+    /// Retombée de l'enveloppe pitch en secondes (`.prelease(0.1)`).
+    pub prelease: Option<f64>,
+    /// Génération d'évaluation : une voix d'une époque ancienne est remplacée
+    /// par un nouveau déclenchement (feedback immédiat quand un slider change).
+    pub epoch: u64,
 }
 
 /// Параметры для отложенного рендера GM-ноты (вне блокировки state).
@@ -149,6 +166,23 @@ struct Voice {
     /// Passe-haut par voix (Hz) ; 0 = inactif. `hp_state` = mémoire du filtre.
     pub hcutoff_hz: f32,
     pub hp_state: f32,
+    /// Décimation : garde chaque Nᵉ échantillon (`coarse`). ≤1 = inactif.
+    pub coarse_step: u32,
+    pub coarse_hold: f32,
+    pub coarse_cnt: u32,
+    /// Quantification bits (`crush`) ; 0 = inactif.
+    pub crush_bits: u8,
+    /// Compresseur : seuil (dB) et ratio. ratio ≤ 1 = inactif.
+    pub comp_thresh_db: f32,
+    pub comp_ratio: f32,
+    pub comp_env: f32,
+    /// Enveloppe de pitch : excursion en demi-tons + temps de montée/retombée (s).
+    /// penv_st == 0 = inactif.
+    pub penv_st: f32,
+    pub pattack_s: f32,
+    pub prelease_s: f32,
+    /// Génération d'évaluation (remplacement des voix d'anciennes générations).
+    pub epoch: u64,
 }
 
 /// Параметры эффектов по умолчанию (0 = без огибающей/реверба).
@@ -244,14 +278,26 @@ impl AudioRenderState {
                         / voice.sample.channels.max(1) as f32
                         / voice.sample.sample_rate.max(1) as f32;
                     if dur_secs > LONG_SAMPLE_SECS {
-                        let same_playing = self.voices.iter().any(|v| {
-                            let s = &v.sample;
-                            Arc::ptr_eq(s, &voice.sample)
-                                || (s.data.len() == voice.sample.data.len()
-                                    && s.channels == voice.sample.channels
-                                    && s.sample_rate == voice.sample.sample_rate)
+                        // Même époque d'éval = retrigger du même pattern → on
+                        // ignore (la prise finit avant la suivante). Époque
+                        // différente = nouveau code évalué → on REMPLACE pour
+                        // que les paramètres changés soient audibles tout de
+                        // suite au lieu d'attendre la fin de la prise.
+                        let mut same_epoch = false;
+                        self.voices.retain(|v| {
+                            let same_sample = Arc::ptr_eq(&v.sample, &voice.sample)
+                                || (v.sample.data.len() == voice.sample.data.len()
+                                    && v.sample.channels == voice.sample.channels
+                                    && v.sample.sample_rate == voice.sample.sample_rate);
+                            if !same_sample {
+                                return true;
+                            }
+                            if v.epoch == voice.epoch {
+                                same_epoch = true;
+                            }
+                            v.epoch == voice.epoch
                         });
-                        if same_playing {
+                        if same_epoch {
                             continue;
                         }
                     }
@@ -763,6 +809,33 @@ impl AudioEngine {
                     v.hp_state += alpha * (mono - v.hp_state);
                     mono -= v.hp_state;
                 }
+                // `.coarse(n)` — faux resampling : on garde le même échantillon
+                // pendant n frames (sample-and-hold → aliasing cruncheur).
+                if v.coarse_step > 1 {
+                    if v.coarse_cnt % v.coarse_step == 0 {
+                        v.coarse_hold = mono;
+                    }
+                    v.coarse_cnt += 1;
+                    mono = v.coarse_hold;
+                }
+                // `.crush(b)` — quantification sur b bits (bitcrush d'amplitude).
+                if v.crush_bits > 0 && v.crush_bits < 16 {
+                    let scale = (1u32 << (v.crush_bits - 1)) as f32;
+                    mono = (mono * scale).round() / scale;
+                }
+                // `.compressor(seuilDb).compressorRatio(r)` — env suiveur de
+                // crête (release ~30 ms) puis réduction au-dessus du seuil.
+                if v.comp_ratio > 1.0 {
+                    let a = mono.abs();
+                    v.comp_env = a.max(v.comp_env * (1.0 - 1.4e-3));
+                    if v.comp_env > 1e-6 {
+                        let env_db = 20.0 * v.comp_env.log10();
+                        if env_db > v.comp_thresh_db {
+                            let excess = env_db - v.comp_thresh_db;
+                            mono *= 10f32.powf(-excess * (1.0 - 1.0 / v.comp_ratio) / 20.0);
+                        }
+                    }
+                }
 
                 let env = envelope(
                     v.attack,
@@ -786,7 +859,23 @@ impl AudioEngine {
                 reverb_send_l += dry_l * room;
                 reverb_send_r += dry_r * room;
 
-                v.position += v.rate;
+                // `.penv(st).pattack(s).prelease(s)` — l'enveloppe de pitch
+                // module la vitesse de lecture : rampe 0→st sur pattack_s en
+                // début de voix, palier à st, descente st→0 sur prelease_s.
+                let mut rate = v.rate;
+                if v.penv_st != 0.0 {
+                    let vt = (t - v.start_time as f32).max(0.0);
+                    let dur = (v.end_time - v.start_time).max(1e-3) as f32;
+                    let st = if v.pattack_s > 0.0 && vt < v.pattack_s {
+                        v.penv_st * (vt / v.pattack_s)
+                    } else if v.prelease_s > 0.0 && vt > dur - v.prelease_s {
+                        v.penv_st * ((dur - vt) / v.prelease_s).clamp(0.0, 1.0)
+                    } else {
+                        v.penv_st
+                    };
+                    rate *= 2f32.powf(st / 12.0);
+                }
+                v.position += rate;
             }
 
             let rp = render_state.reverb_pos;
@@ -1123,6 +1212,17 @@ impl AudioEngine {
             lp_state: 0.0,
             hcutoff_hz: 0.0,
             hp_state: 0.0,
+            coarse_step: 0,
+            coarse_hold: 0.0,
+            coarse_cnt: 0,
+            crush_bits: 0,
+            comp_thresh_db: 0.0,
+            comp_ratio: 0.0,
+            comp_env: 0.0,
+            penv_st: 0.0,
+            pattack_s: 0.0,
+            prelease_s: 0.0,
+            epoch: 0,
         })
     }
 
@@ -1170,7 +1270,7 @@ impl AudioEngine {
                     ev_cut(&event),
                     ev_shape(&event),
                 ) {
-                    self.enqueue_voice(with_hcutoff(with_cutoff(with_speed(voice, event.speed), event.cutoff), event.hcutoff));
+                    self.enqueue_voice(with_voice_fx(voice, &event));
                 }
             }
             return;
@@ -1197,7 +1297,7 @@ impl AudioEngine {
                 ev_cut(&event),
                 ev_shape(&event),
             ) {
-                self.enqueue_voice(with_hcutoff(with_cutoff(with_speed(voice, event.speed), event.cutoff), event.hcutoff));
+                self.enqueue_voice(with_voice_fx(voice, &event));
             }
             return;
         }
@@ -1252,7 +1352,7 @@ impl AudioEngine {
                         params.cut,
                         params.shape,
                     ) {
-                        self.enqueue_voice(with_hcutoff(with_cutoff(with_speed(voice, event.speed), event.cutoff), event.hcutoff));
+                        self.enqueue_voice(with_voice_fx(voice, &event));
                     }
                 }
                 return;
@@ -1303,7 +1403,7 @@ impl AudioEngine {
             ev_cut(&event),
             ev_shape(&event),
         ) {
-            self.enqueue_voice(with_hcutoff(with_cutoff(with_speed(voice, event.speed), event.cutoff), event.hcutoff));
+            self.enqueue_voice(with_voice_fx(voice, &event));
         }
     }
 
@@ -2081,6 +2181,35 @@ fn with_cutoff(mut voice: Voice, cutoff: Option<f64>) -> Voice {
     voice
 }
 
+/// Applique tous les FX issus de l'événement (speed, filtres, crush, coarse,
+/// compresseur, enveloppe de pitch, époque) à une voix fraîche.
+fn with_voice_fx(mut voice: Voice, ev: &AudioEvent) -> Voice {
+    voice = with_hcutoff(with_cutoff(with_speed(voice, ev.speed), ev.cutoff), ev.hcutoff);
+    voice.coarse_step = ev
+        .coarse
+        .filter(|c| c.is_finite() && *c > 1.0)
+        .map(|c| c.round().clamp(1.0, 256.0) as u32)
+        .unwrap_or(0);
+    voice.crush_bits = ev
+        .crush
+        .filter(|c| c.is_finite() && *c >= 1.0)
+        .map(|c| c.round().clamp(1.0, 15.0) as u8)
+        .unwrap_or(0);
+    let ratio = ev.compressor_ratio.unwrap_or(1.0);
+    if ratio.is_finite() && ratio > 1.0 {
+        voice.comp_thresh_db = ev
+            .compressor
+            .filter(|t| t.is_finite() && *t < 0.0)
+            .unwrap_or(-32.0) as f32;
+        voice.comp_ratio = ratio as f32;
+    }
+    voice.penv_st = ev.penv.filter(|p| p.is_finite()).unwrap_or(0.0) as f32;
+    voice.pattack_s = ev.pattack.filter(|p| p.is_finite() && *p > 0.0).unwrap_or(0.0) as f32;
+    voice.prelease_s = ev.prelease.filter(|p| p.is_finite() && *p > 0.0).unwrap_or(0.0) as f32;
+    voice.epoch = ev.epoch;
+    voice
+}
+
 /// Fréquence (Hz) d'une note MIDI, A4 (69) = 440 Hz.
 fn midi_to_freq(midi: f32) -> f32 {
     440.0 * 2f32.powf((midi - 69.0) / 12.0)
@@ -2415,6 +2544,17 @@ mod speed_tests {
             lp_state: 0.0,
             hcutoff_hz: 0.0,
             hp_state: 0.0,
+            coarse_step: 0,
+            coarse_hold: 0.0,
+            coarse_cnt: 0,
+            crush_bits: 0,
+            comp_thresh_db: 0.0,
+            comp_ratio: 0.0,
+            comp_env: 0.0,
+            penv_st: 0.0,
+            pattack_s: 0.0,
+            prelease_s: 0.0,
+            epoch: 0,
         }
     }
 

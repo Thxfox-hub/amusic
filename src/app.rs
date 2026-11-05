@@ -762,6 +762,14 @@ impl StruidelApp {
                             speed: ev.speed,
                             cutoff: ev.cutoff,
                             hcutoff: ev.hcutoff,
+                            coarse: ev.coarse,
+                            crush: ev.crush,
+                            compressor: ev.compressor,
+                            compressor_ratio: ev.compressor_ratio,
+                            penv: ev.penv,
+                            pattack: ev.pattack,
+                            prelease: ev.prelease,
+                            epoch: ev.epoch,
                         });
                     }
                 });
@@ -1588,6 +1596,14 @@ impl StruidelApp {
                             speed: ev.speed,
                             cutoff: ev.cutoff,
                             hcutoff: ev.hcutoff,
+                            coarse: ev.coarse,
+                            crush: ev.crush,
+                            compressor: ev.compressor,
+                            compressor_ratio: ev.compressor_ratio,
+                            penv: ev.penv,
+                            pattack: ev.pattack,
+                            prelease: ev.prelease,
+                            epoch: ev.epoch,
                         }
                     };
                     let (gm_events, other_events): (Vec<_>, Vec<_>) = result

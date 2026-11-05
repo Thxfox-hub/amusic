@@ -138,6 +138,20 @@ struct SerdeAudioValue {
     cutoff: Option<f64>,
     #[serde(default)]
     hcutoff: Option<f64>,
+    #[serde(default)]
+    coarse: Option<f64>,
+    #[serde(default)]
+    crush: Option<f64>,
+    #[serde(default)]
+    compressor: Option<f64>,
+    #[serde(default)]
+    compressorRatio: Option<f64>,
+    #[serde(default)]
+    penv: Option<f64>,
+    #[serde(default)]
+    pattack: Option<f64>,
+    #[serde(default)]
+    prelease: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -169,6 +183,22 @@ pub struct StrudelAudioEvent {
     pub speed: Option<f64>,
     pub cutoff: Option<f64>,
     pub hcutoff: Option<f64>,
+    pub coarse: Option<f64>,
+    pub crush: Option<f64>,
+    /// Seuil du compresseur en dB (`.compressor(-32)`), None = pas de compression.
+    pub compressor: Option<f64>,
+    /// Ratio du compresseur (`.compressorRatio(10)`), None = pas de compression.
+    pub compressor_ratio: Option<f64>,
+    /// Enveloppe de pitch en demi-tons (`.penv(3)`).
+    pub penv: Option<f64>,
+    /// Durée de montée du pitch en secondes (`.pattack(0.05)`).
+    pub pattack: Option<f64>,
+    /// Durée de retombée du pitch en secondes (`.prelease(0.1)`).
+    pub prelease: Option<f64>,
+    /// Génération d'evaluation : incrémentée à chaque `evaluate()` ; permet au
+    /// moteur audio de remplacer les voix d'un ancien code au lieu de les laisser
+    /// jouer leurs anciens paramètres (les options semblaient alors « mortes »).
+    pub epoch: u64,
 }
 
 pub struct AudioWindowResult {
@@ -207,6 +237,8 @@ struct BridgeState {
     /// Прогресс скачивания (pack, current, total) из runner stdout.
     download_progress: Option<DownloadProgress>,
     loadsamples_completed: bool,
+    /// Génération d'evaluation — tamponnée sur chaque événement audio.
+    eval_epoch: u64,
 }
 
 impl Default for BridgeState {
@@ -221,6 +253,7 @@ impl Default for BridgeState {
             sample_progress: None,
             download_progress: None,
             loadsamples_completed: false,
+            eval_epoch: 0,
         }
     }
 }
@@ -464,6 +497,10 @@ fn run_worker(
                                     }
                                 } else {
                                     let cps = resp_msg.cps.unwrap_or(1.0);
+                                    let epoch = state
+                                        .lock()
+                                        .map(|s| s.eval_epoch)
+                                        .unwrap_or(0);
                                     let events = resp_msg
                                         .audio_events
                                         .unwrap_or_default()
@@ -487,6 +524,13 @@ fn run_worker(
                                                 speed: None,
                                                 cutoff: None,
                                                 hcutoff: None,
+                                                coarse: None,
+                                                crush: None,
+                                                compressor: None,
+                                                compressorRatio: None,
+                                                penv: None,
+                                                pattack: None,
+                                                prelease: None,
                                             });
                                             StrudelAudioEvent {
                                                 begin: e.begin,
@@ -508,6 +552,14 @@ fn run_worker(
                                                 speed: v.speed,
                                                 cutoff: v.cutoff,
                                                 hcutoff: v.hcutoff,
+                                                coarse: v.coarse,
+                                                crush: v.crush,
+                                                compressor: v.compressor,
+                                                compressor_ratio: v.compressorRatio,
+                                                penv: v.penv,
+                                                pattack: v.pattack,
+                                                prelease: v.prelease,
+                                                epoch,
                                             }
                                         })
                                         .collect();
@@ -974,6 +1026,9 @@ impl StrudelBridge {
 
     pub fn evaluate(&mut self, code: &str) -> Result<(), String> {
         self.clear_events_cache();
+        if let Ok(mut s) = self.state.lock() {
+            s.eval_epoch = s.eval_epoch.wrapping_add(1);
+        }
         if let Some(ref tx) = self.tx {
             tx.send(NodeCommand::Eval {
                 code: code.to_string(),
