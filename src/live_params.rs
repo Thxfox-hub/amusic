@@ -107,7 +107,7 @@ pub struct SoundOption {
 /// paramètre superdough (sinon le contrôle serait muet). Pas de « noise gate »
 /// : inexistant dans Strudel (`.gate` = durée, pas un seuil).
 pub const SOUND_OPTIONS: &[SoundOption] = &[
-    SoundOption { label: "Pitch (demi-tons)", code: ".speed(semitones(slider(2.5,-12,12)))" },
+    SoundOption { label: "Pitch (demi-tons)", code: ".speed(slider(1.156,0.25,4))" },
     SoundOption { label: "Bitcrush – fréquence", code: ".coarse(slider(5,1,96))" },
     SoundOption { label: "Bitcrush – bits", code: ".crush(slider(8,1,16))" },
     SoundOption { label: "Saturation", code: ".shape(slider(0.4,0,1))" },
