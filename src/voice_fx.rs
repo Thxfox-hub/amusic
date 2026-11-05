@@ -13,10 +13,158 @@ use crate::audio_clip_engine::{
 };
 use crate::audio_dsp::process_resample;
 use crate::mixer_dsp::db_to_gain;
-use crate::project_audio::{FadeCurve, PitchMode, PitchParams, StretchParams};
+use crate::project_audio::{
+    ClipFxParam, ClipVoiceFx, FadeCurve, PitchMode, PitchParams, StretchParams,
+};
 use crate::settings::VoiceFxSettings;
 
 const LIMITER_CEILING: f32 = 0.95;
+
+/// Rend la chaîne FX « lourde » d'un clip (panneau personnalisé) sur la source
+/// déjà chargée : gate → passe-haut → compresseur → saturation → bitcrush →
+/// rampes de pitch → limiteur. Pitch/fades/volume restent hors de ce rendu —
+/// ils vivent en paramètres non destructifs du clip.
+/// Seuls les paramètres *affichés* dans le panneau s'appliquent : un effet
+/// non ajouté par l'utilisateur reste en bypass même si sa valeur est non nulle.
+pub fn render_clip_voice_fx(audio: &mut LoadedAudio, fx: &ClipVoiceFx) {
+    let sr = audio.sample_rate.max(1) as f32;
+    if fx.param_enabled(ClipFxParam::NoiseGate) && fx.gate_db > -79.9 {
+        noise_gate_buffer(audio, fx.gate_db);
+    }
+    if fx.param_enabled(ClipFxParam::Highpass) && fx.highpass_hz > 0.0 {
+        high_pass_buffer(audio, fx.highpass_hz);
+    }
+    if (fx.param_enabled(ClipFxParam::CompThreshold)
+        || fx.param_enabled(ClipFxParam::CompRatio))
+        && fx.comp_ratio > 1.0
+        && fx.comp_threshold_db < -0.05
+    {
+        compress_buffer(audio, fx.comp_threshold_db, fx.comp_ratio, 0.0);
+    }
+    if fx.param_enabled(ClipFxParam::Saturation) && fx.saturation_db > 0.05 {
+        saturate_buffer_db(audio, fx.saturation_db);
+    }
+    if (fx.param_enabled(ClipFxParam::BitcrushRate)
+        || fx.param_enabled(ClipFxParam::BitcrushBits))
+        && fx.bitcrush_rate_hz > 0.0
+        && fx.bitcrush_rate_hz < sr * 0.5
+        && fx.bitcrush_bits > 0.0
+        && fx.bitcrush_bits < 24.0
+    {
+        bitcrush_buffer(audio, fx.bitcrush_rate_hz, fx.bitcrush_bits);
+    }
+    let rise = fx.param_enabled(ClipFxParam::PitchRise) && fx.pitch_rise_semitones.abs() > 0.01;
+    let fall = fx.param_enabled(ClipFxParam::PitchFall) && fx.pitch_fall_semitones.abs() > 0.01;
+    if rise || fall {
+        pitch_ramp_buffer(
+            audio,
+            if rise { fx.pitch_rise_semitones } else { 0.0 },
+            if fall { fx.pitch_fall_semitones } else { 0.0 },
+        );
+    }
+    limit(audio, LIMITER_CEILING);
+}
+
+/// Noise gate / expander : les trames sous le seuil sont atténuées vers 0
+/// (enveloppe attack rapide, release ~80 ms partagée entre canaux).
+fn noise_gate_buffer(audio: &mut LoadedAudio, threshold_db: f32) {
+    let sr = audio.sample_rate.max(1) as f32;
+    let channels = audio.channels.max(1) as usize;
+    let attack = (-1.0 / (0.005 * sr)).exp();
+    let release = (-1.0 / (0.080 * sr)).exp();
+    let mut level = 0.0_f32;
+    for frame in audio.samples.chunks_mut(channels) {
+        let input = frame.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()));
+        let coef = if input > level { attack } else { release };
+        level = input + (level - input) * coef;
+        let level_db = 20.0 * level.max(1.0e-6).log10();
+        // Porte douce : -12 dB de sous-pente sous le seuil, coupe franche à -24.
+        let gain_db = if level_db >= threshold_db {
+            0.0
+        } else {
+            ((threshold_db - level_db) * 2.0).min(48.0)
+        };
+        let gain = db_to_gain(-gain_db);
+        for sample in frame.iter_mut() {
+            *sample *= gain;
+        }
+    }
+}
+
+/// Bitcrush : décimation sample-and-hold à `rate_hz` + quantification à `bits`
+/// niveaux — le grain « lo-fi » classique.
+fn bitcrush_buffer(audio: &mut LoadedAudio, rate_hz: f32, bits: f32) {
+    let sr = audio.sample_rate.max(1) as f32;
+    let channels = audio.channels.max(1) as usize;
+    let hold = (sr / rate_hz.max(1.0)).max(1.0);
+    let levels = 2.0_f32.powi(bits.round() as i32 - 1).max(1.0);
+    let mut hold_pos = 0.0_f32;
+    let mut held = vec![0.0_f32; channels];
+    for frame in audio.samples.chunks_mut(channels) {
+        if hold_pos <= 0.0 {
+            hold_pos += hold;
+            held.copy_from_slice(frame);
+        }
+        hold_pos -= 1.0;
+        for (ch, sample) in frame.iter_mut().enumerate() {
+            *sample = (held[ch] * levels).round() / levels;
+        }
+    }
+}
+
+/// Saturation en dB : k = gain linéaire du dB demandé, `tanh(k·x)/tanh(k)`.
+fn saturate_buffer_db(audio: &mut LoadedAudio, db: f32) {
+    let k = db_to_gain(db).max(1.0);
+    let norm = k.tanh();
+    for sample in audio.samples.iter_mut() {
+        *sample = (k * *sample).tanh() / norm;
+    }
+}
+
+/// Rampes de pitch (style bande) : le taux de lecture monte/descend en
+/// demi-tons sur les ~15 premiers/derniers % du clip. La durée change
+/// légèrement — c'est l'effet recherché.
+fn pitch_ramp_buffer(audio: &mut LoadedAudio, rise_st: f32, fall_st: f32) {
+    let channels = audio.channels.max(1) as usize;
+    let frames = audio.frames();
+    if frames < 8 || channels == 0 {
+        return;
+    }
+    let ramp = (frames / 7).max(1); // ~15% du clip
+    // offset en demi-tons pour la frame i
+    let offset = |i: usize| -> f64 {
+        let mut st = 0.0_f64;
+        if rise_st.abs() > 0.01 && i < ramp {
+            st += rise_st as f64 * (1.0 - i as f64 / ramp as f64);
+        }
+        if fall_st.abs() > 0.01 && i >= frames - ramp {
+            st += fall_st as f64 * ((i - (frames - ramp)) as f64 / ramp as f64);
+        }
+        st
+    };
+    // position source lue = intégrale du taux 2^(st/12), normalisée pour
+    // couvrir toute la source (durée conservée, pitch variable, pas de perte).
+    let mut src_pos = vec![0.0_f64; frames + 1];
+    let mut pos = 0.0_f64;
+    for i in 0..frames {
+        src_pos[i] = pos;
+        pos += 2.0_f64.powf(offset(i) / 12.0);
+    }
+    src_pos[frames] = pos;
+    let scale = (frames - 1) as f64 / pos.max(1.0);
+    let mut out = vec![0.0_f32; frames * channels];
+    for i in 0..frames {
+        let p = (src_pos[i] * scale).min((frames - 2) as f64).max(0.0);
+        let i0 = p.floor() as usize;
+        let frac = (p - i0 as f64) as f32;
+        for ch in 0..channels {
+            let a = audio.samples[i0 * channels + ch];
+            let b = audio.samples[(i0 + 1) * channels + ch];
+            out[i * channels + ch] = a + (b - a) * frac;
+        }
+    }
+    audio.samples = out;
+}
 
 /// Rend la prise avec les effets voix et l'écrit dans `bank_root/<banque>/`.
 /// Retourne le chemin du WAV produit.
@@ -330,5 +478,83 @@ mod tests {
         };
         saturate_buffer(&mut audio, 0.0);
         assert_eq!(audio.samples, vec![0.5, -0.5]);
+    }
+
+    #[test]
+    fn bitcrush_quantizes_and_holds() {
+        // rampe douce de 100 échantillons à 1000 Hz, crush à 200 Hz / 3 bits
+        let samples: Vec<f32> = (0..100).map(|i| i as f32 / 100.0 - 0.5).collect();
+        let mut audio = LoadedAudio {
+            samples: samples.clone(),
+            sample_rate: 1000,
+            channels: 1,
+        };
+        bitcrush_buffer(&mut audio, 200.0, 3.0);
+        // quantification 3 bits → niveaux multiples de 1/4
+        for s in &audio.samples {
+            let q = (s * 4.0).round() / 4.0;
+            assert!((s - q).abs() < 1e-6, "niveau non quantifié: {s}");
+        }
+        // sample-and-hold à 200 Hz (hold=5) → paliers de 5 échantillons
+        assert_eq!(audio.samples[0], audio.samples[1]);
+        assert_eq!(audio.samples[0], audio.samples[4]);
+    }
+
+    #[test]
+    fn noise_gate_silences_quiet_frames() {
+        // 500 trames fortes puis 500 faibles (-40 dB) sous un seuil à -20 dB
+        let mut samples = vec![0.8_f32; 500];
+        samples.extend(vec![0.008_f32; 500]);
+        let mut audio = LoadedAudio {
+            samples,
+            sample_rate: 1000,
+            channels: 1,
+        };
+        noise_gate_buffer(&mut audio, -20.0);
+        assert!(audio.samples[400].abs() > 0.7, "fort atténué à tort");
+        assert!(
+            audio.samples[999].abs() < 0.004,
+            "faible non gatée: {}",
+            audio.samples[999]
+        );
+    }
+
+    #[test]
+    fn pitch_ramp_preserves_length_and_morphs_start() {
+        // sinusoïde : rampe montante change le début, durée identique
+        let frames = 1000usize;
+        let mut audio = LoadedAudio {
+            samples: (0..frames).map(|i| (i as f32 * 0.1).sin()).collect(),
+            sample_rate: 1000,
+            channels: 1,
+        };
+        let before: Vec<f32> = audio.samples.clone();
+        pitch_ramp_buffer(&mut audio, 12.0, 0.0);
+        assert_eq!(audio.samples.len(), before.len());
+        let start_changed = (0..50)
+            .any(|i| (audio.samples[i] - before[i]).abs() > 1e-4);
+        assert!(start_changed, "la rampe n'a pas modifié le début");
+        // la queue reste un contenu audible de même nature (la compensation de
+        // durée décale la lecture, mais ne tronque ni ne coupe rien)
+        let tail_max = audio.samples[frames - 50..]
+            .iter()
+            .fold(0.0_f32, |acc, s| acc.max(s.abs()));
+        assert!(tail_max > 0.5, "queue muette ou tronquée: {tail_max}");
+    }
+
+    #[test]
+    fn render_clip_voice_fx_chain_runs() {
+        let mut audio = LoadedAudio {
+            samples: (0..4800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect(),
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        let fx = ClipVoiceFx {
+            ui_params: crate::project_audio::CLIP_FX_PARAMS_ALL.to_vec(),
+            ..ClipVoiceFx::default()
+        };
+        render_clip_voice_fx(&mut audio, &fx);
+        assert_eq!(audio.frames(), 4800);
+        assert!(audio.samples.iter().all(|s| s.abs() <= 0.96));
     }
 }

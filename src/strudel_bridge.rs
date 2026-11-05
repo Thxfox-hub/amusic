@@ -225,6 +225,33 @@ impl Default for BridgeState {
 /// Максимум строк в буфере терминала (логи runner stderr).
 const TERMINAL_LOG_MAX: usize = 2000;
 
+/// Handle clonable vers le canal de commandes du bridge — permet à un thread
+/// worker d'émettre des requêtes `AudioWindow` sans toucher `StrudelBridge`.
+#[derive(Clone)]
+pub struct BridgeCommandSender(mpsc::Sender<NodeCommand>);
+
+impl BridgeCommandSender {
+    /// Requête audio_window bloquante — à appeler depuis un thread worker, pas l'UI.
+    pub fn audio_window(
+        &self,
+        from: f64,
+        to: f64,
+        wait: Duration,
+    ) -> Result<AudioWindowResult, String> {
+        let (tx_resp, rx_resp) = mpsc::channel();
+        self.0
+            .send(NodeCommand::AudioWindow {
+                from,
+                to,
+                resp: Some(tx_resp),
+            })
+            .map_err(|e| e.to_string())?;
+        rx_resp
+            .recv_timeout(wait)
+            .map_err(|e| format!("audio_window timeout: {e}"))?
+    }
+}
+
 pub struct StrudelBridge {
     tx: Option<mpsc::Sender<NodeCommand>>,
     state: Arc<Mutex<BridgeState>>,
@@ -959,6 +986,12 @@ impl StrudelBridge {
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+
+        /// Clone du canal de commandes node — pour le scheduler hors-UI (`sched-tick`),
+    /// qui continue le scheduling audio quand le thread UI est gelé (fenêtre occluse).
+    pub fn command_sender(&self) -> Option<BridgeCommandSender> {
+        self.tx.clone().map(BridgeCommandSender)
     }
 
     /// Блокирующий запрос (может подвисать UI).

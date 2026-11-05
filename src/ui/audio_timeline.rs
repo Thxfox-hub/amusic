@@ -2,9 +2,9 @@ use eframe::egui;
 
 use crate::audio_recording::RecordingMeters;
 use crate::project_audio::{
-    snap_cycle, AudioClipId, AudioTrackId, CursorMode, FadeCurve, FadeEdge, InputChannelMode,
-    MonitoringMode, PitchMode, PitchParams, ProjectAudioState, RecordMode, StretchAlgorithm,
-    StretchMode, StretchParams,
+    snap_cycle, AudioClipId, AudioTrackId, ClipFxParam, ClipVoiceFx, CursorMode, FadeCurve,
+    FadeEdge, InputChannelMode, MonitoringMode, PitchMode, PitchParams, ProjectAudioState,
+    RecordMode, StretchAlgorithm, StretchMode, StretchParams, CLIP_FX_PARAMS_ALL,
 };
 use crate::settings::VoiceFxSettings;
 use crate::waveform_cache::WaveformPeak;
@@ -28,6 +28,13 @@ pub enum AudioTimelineAction {
     SetStretch(AudioClipId, StretchParams),
     SetPitch(AudioClipId, PitchParams),
     SetVoiceFx(VoiceFxSettings),
+    /// Réglages FX « lourds » d'un clip (panneau personnalisé) — déclenche un
+    /// rendu de la source dérivée côté app.
+    SetClipVoiceFx(AudioClipId, ClipVoiceFx),
+    /// Volume du clip en dB — converti en gain linéaire côté app.
+    SetClipGainDb(AudioClipId, f32),
+    /// Fade du clip en secondes — converti en cycles côté app (courbe incluse).
+    SetClipFadeSecs(AudioClipId, FadeEdge, f32, FadeCurve),
     BounceSession,
     ExportPatterns,
     Undo,
@@ -69,6 +76,7 @@ pub fn audio_timeline_ui(
     voice_fx: &VoiceFxSettings,
     peak_lookup: impl Fn(u64) -> Option<WaveformPeak>,
     view: &mut AudioTimelineViewState,
+    cycles_per_second: f64,
 ) -> Vec<AudioTimelineAction> {
     let mut actions = Vec::new();
     if ui.input(|input| !input.pointer.primary_down()) {
@@ -91,6 +99,7 @@ pub fn audio_timeline_ui(
         ui.add_space(4.0);
         controls(ui, project, view, input_devices, voice_fx, &mut actions);
         selected_clip_inspector(ui, project, &mut actions);
+        selected_clip_fx_editor(ui, project, cycles_per_second, &mut actions);
         ui.add_space(4.0);
 
         let available = ui.available_rect_before_wrap();
@@ -206,7 +215,7 @@ pub fn audio_timeline_ui(
                             clip_rect,
                             clip,
                             selected,
-                            peak_lookup(clip.source_file_id),
+                            peak_lookup(clip.effective_source_file_id()),
                         );
                         handle_clip_drag(
                             ui,
@@ -407,6 +416,251 @@ fn selected_clip_inspector(
     if changed_pitch {
         actions.push(AudioTimelineAction::SetPitch(clip_id, pitch));
     }
+}
+
+/// Vrai si la source du clip est une prise voix (banque `recordings`/`vox`).
+fn is_voice_clip_source(project: &ProjectAudioState, clip_id: AudioClipId) -> bool {
+    let Some(clip) = project.clip(clip_id) else {
+        return false;
+    };
+    let Some(source) = project.pool.sources.get(&clip.source_file_id) else {
+        return false;
+    };
+    source
+        .path
+        .components()
+        .any(|c| c.as_os_str() == "recordings" || c.as_os_str() == "vox")
+}
+
+/// Éditeur personnalisé du clip sélectionné : les sliders affichés sont
+/// choisis par l'utilisateur (`ui_params`) parmi les paramètres applicables
+/// au type de clip — aujourd'hui uniquement les clips voix.
+fn selected_clip_fx_editor(
+    ui: &mut egui::Ui,
+    project: &ProjectAudioState,
+    cycles_per_second: f64,
+    actions: &mut Vec<AudioTimelineAction>,
+) {
+    let Some(clip_id) = project.selected_clip else {
+        return;
+    };
+    if !is_voice_clip_source(project, clip_id) {
+        return;
+    }
+    let Some(clip) = project.clip(clip_id) else {
+        return;
+    };
+    let mut fx = clip.voice_fx.clone().unwrap_or_default();
+    let cps = cycles_per_second.max(0.001);
+    let mut fx_dirty = false;
+    let mut remove_param: Option<usize> = None;
+    let mut add_param: Option<ClipFxParam> = None;
+
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("🎙 Éditeur voix").strong());
+            ui.separator();
+            ui.label(
+                egui::RichText::new("rendu dans la source dérivée — pitch/fades/volume restent live")
+                    .weak()
+                    .small(),
+            );
+        });
+
+        // Un paramètre par point : label en ligne, slider pleine largeur dessous.
+        for (index, &param) in fx.ui_params.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("• {}", param_label(param))).strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("×")
+                        .on_hover_text("retirer ce paramètre")
+                        .clicked()
+                    {
+                        remove_param = Some(index);
+                    }
+                    // Rampes de pitch : le on/off vit sur la ligne du label.
+                    if matches!(param, ClipFxParam::PitchRise | ClipFxParam::PitchFall) {
+                        let on = match param {
+                            ClipFxParam::PitchRise => fx.pitch_rise_semitones != 0.0,
+                            _ => fx.pitch_fall_semitones != 0.0,
+                        };
+                        let mut toggle = on;
+                        if ui
+                            .checkbox(&mut toggle, if on { "on" } else { "off" })
+                            .changed()
+                        {
+                            let v = if toggle { 3.0 } else { 0.0 };
+                            match param {
+                                ClipFxParam::PitchRise => fx.pitch_rise_semitones = v,
+                                _ => fx.pitch_fall_semitones = v,
+                            }
+                            fx_dirty = true;
+                        }
+                    }
+                });
+            });
+            match param {
+                ClipFxParam::Pitch => {
+                    let mut v = clip.pitch.semitones;
+                    if slider_semi(ui, &mut v, -24.0..=24.0) {
+                        let mut pitch = clip.pitch.clone();
+                        pitch.semitones = v;
+                        actions.push(AudioTimelineAction::SetPitch(clip_id, pitch));
+                    }
+                }
+                ClipFxParam::FadeIn | ClipFxParam::FadeOut => {
+                    let (edge, curve, mut v) = if param == ClipFxParam::FadeIn {
+                        (
+                            FadeEdge::In,
+                            FadeCurve::Linear,
+                            (clip.fade_in.length / cps) as f32,
+                        )
+                    } else {
+                        (
+                            FadeEdge::Out,
+                            FadeCurve::Exponential,
+                            (clip.fade_out.length / cps) as f32,
+                        )
+                    };
+                    if slider_secs(ui, &mut v, 0.0..=3.0) {
+                        actions.push(AudioTimelineAction::SetClipFadeSecs(
+                            clip_id, edge, v, curve,
+                        ));
+                    }
+                }
+                ClipFxParam::Volume => {
+                    let mut v = gain_to_db(clip.gain);
+                    if slider_db(ui, &mut v, -24.0..=12.0) {
+                        actions.push(AudioTimelineAction::SetClipGainDb(clip_id, v));
+                    }
+                }
+                ClipFxParam::BitcrushRate => {
+                    fx_dirty |= slider_hz(ui, &mut fx.bitcrush_rate_hz, 100.0..=24000.0);
+                }
+                ClipFxParam::BitcrushBits => {
+                    fx_dirty |= slider_plain(ui, &mut fx.bitcrush_bits, 1.0..=24.0, " bits");
+                }
+                ClipFxParam::Saturation => {
+                    fx_dirty |= slider_db(ui, &mut fx.saturation_db, 0.0..=24.0);
+                }
+                ClipFxParam::CompThreshold => {
+                    fx_dirty |= slider_db(ui, &mut fx.comp_threshold_db, -60.0..=0.0);
+                }
+                ClipFxParam::CompRatio => {
+                    fx_dirty |= slider_plain(ui, &mut fx.comp_ratio, 1.0..=20.0, " :1");
+                }
+                ClipFxParam::Highpass => {
+                    fx_dirty |= slider_hz(ui, &mut fx.highpass_hz, 0.0..=500.0);
+                }
+                ClipFxParam::NoiseGate => {
+                    fx_dirty |= slider_db(ui, &mut fx.gate_db, -80.0..=0.0);
+                }
+                ClipFxParam::PitchRise => {
+                    if fx.pitch_rise_semitones != 0.0 {
+                        fx_dirty |=
+                            slider_semi(ui, &mut fx.pitch_rise_semitones, -12.0..=12.0);
+                    }
+                }
+                ClipFxParam::PitchFall => {
+                    if fx.pitch_fall_semitones != 0.0 {
+                        fx_dirty |=
+                            slider_semi(ui, &mut fx.pitch_fall_semitones, -12.0..=12.0);
+                    }
+                }
+            }
+            ui.add_space(4.0);
+        }
+
+        // « + paramètre » : propose ce qui n'est pas encore affiché.
+        let missing: Vec<ClipFxParam> = CLIP_FX_PARAMS_ALL
+            .iter()
+            .copied()
+            .filter(|p| !fx.ui_params.contains(p))
+            .collect();
+        if !missing.is_empty() {
+            egui::ComboBox::from_id_salt(("clip_fx_add", clip_id))
+                .selected_text("+ paramètre")
+                .show_ui(ui, |ui| {
+                    for p in missing {
+                        if ui.selectable_label(false, param_label(p)).clicked() {
+                            add_param = Some(p);
+                        }
+                    }
+                });
+        }
+    });
+
+    if let Some(index) = remove_param {
+        let removed = fx.ui_params.remove(index);
+        // La valeur repart au défaut : retirer le paramètre coupe son effet.
+        fx.reset_param(removed);
+        fx_dirty = true;
+    }
+    if let Some(p) = add_param {
+        fx.ui_params.push(p);
+        fx_dirty = true;
+    }
+    if fx_dirty {
+        actions.push(AudioTimelineAction::SetClipVoiceFx(clip_id, fx));
+    }
+}
+
+fn param_label(param: ClipFxParam) -> &'static str {
+    match param {
+        ClipFxParam::Pitch => "Pitch (demi-tons)",
+        ClipFxParam::BitcrushRate => "Bitcrush – fréquence",
+        ClipFxParam::BitcrushBits => "Bitcrush – bits",
+        ClipFxParam::Saturation => "Saturation",
+        ClipFxParam::CompThreshold => "Compression – seuil",
+        ClipFxParam::CompRatio => "Compression – ratio",
+        ClipFxParam::Highpass => "Coupe-bas",
+        ClipFxParam::NoiseGate => "Noise gate",
+        ClipFxParam::FadeIn => "Crescendo début",
+        ClipFxParam::FadeOut => "Decrescendo fin",
+        ClipFxParam::PitchRise => "Montée de pitch au début",
+        ClipFxParam::PitchFall => "Chute de pitch à la fin",
+        ClipFxParam::Volume => "Volume",
+    }
+}
+
+fn gain_to_db(gain: f32) -> f32 {
+    20.0 * gain.max(1.0e-6).log10()
+}
+
+fn slider_plain(
+    ui: &mut egui::Ui,
+    v: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    suffix: &'static str,
+) -> bool {
+    // Pleine largeur du panneau : le slider vit seul sur sa ligne.
+    let width = ui.available_width();
+    ui.add_sized(
+        [width, 20.0],
+        egui::Slider::new(v, range)
+            .suffix(suffix)
+            .fixed_decimals(2),
+    )
+    .changed()
+}
+
+fn slider_semi(ui: &mut egui::Ui, v: &mut f32, r: std::ops::RangeInclusive<f32>) -> bool {
+    slider_plain(ui, v, r, " semi")
+}
+
+fn slider_db(ui: &mut egui::Ui, v: &mut f32, r: std::ops::RangeInclusive<f32>) -> bool {
+    slider_plain(ui, v, r, " dB")
+}
+
+fn slider_hz(ui: &mut egui::Ui, v: &mut f32, r: std::ops::RangeInclusive<f32>) -> bool {
+    slider_plain(ui, v, r, " Hz")
+}
+
+fn slider_secs(ui: &mut egui::Ui, v: &mut f32, r: std::ops::RangeInclusive<f32>) -> bool {
+    slider_plain(ui, v, r, " s")
 }
 
 fn collect_hotkeys(ui: &mut egui::Ui, actions: &mut Vec<AudioTimelineAction>) {

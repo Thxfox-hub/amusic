@@ -5,7 +5,11 @@ edition = "2021"
 description = "struIDEl native UI (egui), Strudel bridge TBD"
 
 [dependencies]
-eframe = "0.33"
+# accesskit exclu : sérialise l'arbre de widgets (serde/zbus) sur le thread UI
+# quand AT-SPI tourne → 100% CPU + freezes multi-secondes pendant la lecture.
+eframe = { version = "0.33", default-features = false, features = [
+    "default_fonts", "glow", "wayland", "x11",
+] }
 egui = "0.33"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

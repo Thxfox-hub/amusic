@@ -236,9 +236,10 @@ impl ClipRenderEngine {
             {
                 continue;
             }
+            let effective_id = clip.effective_source_file_id();
             let source = sources
-                .get(&clip.source_file_id)
-                .ok_or_else(|| format!("missing audio source {}", clip.source_file_id))?;
+                .get(&effective_id)
+                .ok_or_else(|| format!("missing audio source {}", effective_id))?;
             if !source_cache.contains_key(&source.id) {
                 source_cache.insert(source.id, load_audio_file(&source.path)?);
             }
@@ -901,6 +902,8 @@ mod tests {
             selected_take: None,
             muted: false,
             name: None,
+            voice_fx: None,
+            fx_source_file_id: None,
         };
         assert!(fade_envelope(&clip, 0, 100) < 0.1);
         assert!(fade_envelope(&clip, 50, 100) > 0.9);
@@ -939,6 +942,8 @@ mod tests {
             selected_take: None,
             muted: false,
             name: None,
+            voice_fx: None,
+            fx_source_file_id: None,
         };
         let segments = build_warp_segments(&clip, &clip.warp_markers, 400, 400, 100.0, 1.0, 1_000);
         let mut seg_idx = 0usize;

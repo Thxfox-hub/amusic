@@ -34,6 +34,35 @@ impl RecordingController {
             .collect()
     }
 
+    /// Liste cachée : `input_devices()` coûte très cher (ALSA énumère tout le
+    /// système, y compris Bluetooth — jusqu'à plusieurs secondes) → jamais sur
+    /// le thread UI. Retourne le cache ; le premier appel lance un refresh
+    /// en arrière-plan et renvoie une liste vide/stale en attendant.
+    pub fn input_devices_cached() -> Vec<String> {
+        static CACHE: std::sync::Mutex<Option<(Instant, Vec<String>)>> =
+            std::sync::Mutex::new(None);
+        static REFRESHING: AtomicBool = AtomicBool::new(false);
+        const TTL: std::time::Duration = std::time::Duration::from_secs(20);
+
+        let stale = match CACHE.lock() {
+            Ok(g) => match &*g {
+                Some((at, list)) if at.elapsed() < TTL => return list.clone(),
+                other => other.as_ref().map(|(_, l)| l.clone()),
+            },
+            Err(_) => None,
+        };
+        if !REFRESHING.swap(true, Ordering::SeqCst) {
+            std::thread::spawn(|| {
+                let list = Self::input_devices();
+                if let Ok(mut g) = CACHE.lock() {
+                    *g = Some((Instant::now(), list));
+                }
+                REFRESHING.store(false, Ordering::SeqCst);
+            });
+        }
+        stale.unwrap_or_default()
+    }
+
     pub fn is_recording(&self) -> bool {
         self.active.is_some()
     }

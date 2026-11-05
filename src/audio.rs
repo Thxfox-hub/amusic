@@ -174,6 +174,17 @@ enum AudioCommand {
     Clear,
 }
 
+/// Charge temps réel du callback audio — compteurs partagés avec l'UI pour
+/// exposer voix actives / durée de callback (vérifie la surcharge ALSA).
+#[derive(Default)]
+pub struct AudioLoadStats {
+    pub voices_active: AtomicU64,
+    pub voices_peak: AtomicU64,
+    pub cb_nanos_last: AtomicU64,
+    pub cb_nanos_max: AtomicU64,
+    pub buffer_frames: AtomicU64,
+}
+
 struct AudioRenderState {
     sample_rate: f32,
     sample_clock: u64,
@@ -207,6 +218,27 @@ impl AudioRenderState {
         while let Ok(command) = command_rx.try_recv() {
             match command {
                 AudioCommand::AddVoice(voice) => {
+                    // `.cut(n)` = groupe de coupure (sémantique Tidal/Strudel) :
+                    // la nouvelle voix tue toutes les voix du même groupe n.
+                    // Garantit « une voix à la fois » — ex. s("recording-7").cut(1).
+                    if voice.cut > 0.0 {
+                        self.voices.retain(|v| v.cut != voice.cut);
+                    }
+                    // Plafond par sample : un s() retrigger chaque cycle sur un
+                    // fichier long empile sinon des dizaines de voix identiques
+                    // → le callback dépasse son budget et la carte son crache.
+                    // 32 laisse vivre les roulements de batterie légitimes.
+                    const MAX_VOICES_PER_SAMPLE: usize = 32;
+                    let same: Vec<usize> = self
+                        .voices
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| Arc::ptr_eq(&v.sample, &voice.sample))
+                        .map(|(i, _)| i)
+                        .collect();
+                    if same.len() >= MAX_VOICES_PER_SAMPLE {
+                        self.voices.remove(same[0]);
+                    }
                     if self.voices.len() >= self.voices.capacity() {
                         // Saturé : on sacrifie la voix la plus ancienne plutôt
                         // que la nouvelle (sinon le clic/événement courant est muet).
@@ -250,6 +282,11 @@ pub struct AudioEngine {
     daw_transport: Arc<ArcSwap<LiveTransportSnapshot>>,
     master_meter: Arc<MeterAtomics>,
     daw_meters: Arc<Vec<MeterAtomics>>,
+    /// Erreurs du callback stream (POLLERR & co) : un compteur qui grimpe
+    /// signale un device mort — l'UI reconstruit l'engine en arrière-plan.
+    stream_errors: Arc<AtomicU64>,
+    /// Charge temps réel du callback (voix, durée) — exposée dans le status.
+    load_stats: Arc<AudioLoadStats>,
     _stream: cpal::Stream,
 }
 
@@ -477,6 +514,8 @@ impl AudioEngine {
             }
         });
 
+        let stream_errors = Arc::new(AtomicU64::new(0));
+        let load_stats = Arc::new(AudioLoadStats::default());
         let stream = match supported_config.sample_format() {
             cpal::SampleFormat::F32 => Self::build_output_stream::<f32>(
                 &device,
@@ -490,6 +529,8 @@ impl AudioEngine {
                 Arc::clone(&daw_transport),
                 Arc::clone(&master_meter),
                 Arc::clone(&daw_meters),
+                Arc::clone(&stream_errors),
+                Arc::clone(&load_stats),
             )?,
             cpal::SampleFormat::I16 => Self::build_output_stream::<i16>(
                 &device,
@@ -503,6 +544,8 @@ impl AudioEngine {
                 Arc::clone(&daw_transport),
                 Arc::clone(&master_meter),
                 Arc::clone(&daw_meters),
+                Arc::clone(&stream_errors),
+                Arc::clone(&load_stats),
             )?,
             cpal::SampleFormat::U16 => Self::build_output_stream::<u16>(
                 &device,
@@ -516,6 +559,8 @@ impl AudioEngine {
                 Arc::clone(&daw_transport),
                 Arc::clone(&master_meter),
                 Arc::clone(&daw_meters),
+                Arc::clone(&stream_errors),
+                Arc::clone(&load_stats),
             )?,
             other => return Err(format!("Unsupported sample format: {other:?}")),
         };
@@ -527,6 +572,8 @@ impl AudioEngine {
         Ok(Self {
             control,
             command_tx,
+            stream_errors,
+            load_stats,
             sample_clock,
             sample_rate,
             mixer,
@@ -550,15 +597,16 @@ impl AudioEngine {
         daw_transport: Arc<ArcSwap<LiveTransportSnapshot>>,
         master_meter: Arc<MeterAtomics>,
         daw_meters: Arc<Vec<MeterAtomics>>,
+        stream_errors: Arc<AtomicU64>,
+        load_stats: Arc<AudioLoadStats>,
     ) -> Result<cpal::Stream, String>
     where
         T: CpalSample + SizedSample + FromSample<f32>,
     {
-        let err_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let err_fn = move |err| {
             // Limite le spam stderr : un device audio qui disparaît (BT off, etc.)
             // produit des POLLERR en boucle — sans plafond le log remplit /tmp.
-            let n = err_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n = stream_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 50 || n % 10_000 == 0 {
                 eprintln!("[AudioEngine] stream error: {err} (x{})", n + 1);
             }
@@ -585,6 +633,7 @@ impl AudioEngine {
                         &daw_transport,
                         &master_meter,
                         &daw_meters,
+                        &load_stats,
                     );
                 },
                 err_fn,
@@ -604,9 +653,11 @@ impl AudioEngine {
         daw_transport: &Arc<ArcSwap<LiveTransportSnapshot>>,
         master_meter: &Arc<MeterAtomics>,
         daw_meters: &Arc<Vec<MeterAtomics>>,
+        load_stats: &Arc<AudioLoadStats>,
     ) where
         T: CpalSample + SizedSample + FromSample<f32>,
     {
+        let cb_start = std::time::Instant::now();
         render_state.drain_commands(command_rx);
         let sr = render_state.sample_rate;
         let snapshot = mixer.load();
@@ -616,14 +667,22 @@ impl AudioEngine {
         let mut daw_meter_acc = [MeterAccumulator::default(); MAX_LIVE_DAW_CHANNELS];
         let previous_hold = master_meter.clip_hold_blocks.load(Ordering::Relaxed);
 
+        // Purge des voix finies — une fois par buffer suffit (le skip par frame
+        // gère celles qui meurent en cours de buffer).
+        let t0 = render_state.sample_clock as f32 / sr;
+        render_state
+            .voices
+            .retain(|v| t0 < v.end_time as f32 && v.position < v.frames as f32);
+        let n_voices = render_state.voices.len() as u64;
+        load_stats.voices_active.store(n_voices, Ordering::Relaxed);
+        load_stats.voices_peak.fetch_max(n_voices, Ordering::Relaxed);
+        load_stats
+            .buffer_frames
+            .store(output.len() as u64, Ordering::Relaxed);
+
         for frame in output.chunks_mut(channels) {
             let t = render_state.sample_clock as f32 / sr;
             render_state.sample_clock = render_state.sample_clock.wrapping_add(1);
-
-            // Удаляем отыгравшие голоса.
-            render_state
-                .voices
-                .retain(|v| t < v.end_time as f32 && v.position < v.frames as f32);
 
             let mut left = 0.0f32;
             let mut right = 0.0f32;
@@ -661,10 +720,8 @@ impl AudioEngine {
                     let drive = 1.0 + shape * 12.0;
                     mono = (mono * drive).tanh() / drive;
                 }
-                let cut = v.cut.clamp(0.0, 1.0);
-                if cut > 0.0 {
-                    mono *= 1.0 - cut * 0.5;
-                }
+                // `v.cut` est un identifiant de groupe de coupure (géré à
+                // l'ajout de la voix), pas un atténuateur — rien à faire ici.
                 if v.cutoff_hz > 0.0 {
                     let alpha = crate::mixer_dsp::one_pole_alpha(sr, v.cutoff_hz);
                     v.lp_state += alpha * (mono - v.lp_state);
@@ -774,6 +831,10 @@ impl AudioEngine {
                 atomics.store(acc.finish(previous_hold));
             }
         }
+
+        let nanos = cb_start.elapsed().as_nanos() as u64;
+        load_stats.cb_nanos_last.store(nanos, Ordering::Relaxed);
+        load_stats.cb_nanos_max.fetch_max(nanos, Ordering::Relaxed);
     }
 
     pub fn update_mixer_snapshot(&self, project: &ProjectAudioState) {
@@ -847,18 +908,19 @@ impl AudioEngine {
             }
             let mut clips = Vec::new();
             for clip in track.clips.iter().filter(|clip| !clip.muted) {
-                let Some(source_meta) = project.pool.sources.get(&clip.source_file_id) else {
+                let effective_id = clip.effective_source_file_id();
+                let Some(source_meta) = project.pool.sources.get(&effective_id) else {
                     continue;
                 };
-                if !control.project_sources.contains_key(&clip.source_file_id) {
+                if !control.project_sources.contains_key(&effective_id) {
                     match load_wav_sample(&source_meta.path) {
                         Ok(source) => {
-                            control.project_sources.insert(clip.source_file_id, source);
+                            control.project_sources.insert(effective_id, source);
                         }
                         Err(err) => {
                             if control
                                 .broken_project_sources
-                                .insert(clip.source_file_id)
+                                .insert(effective_id)
                             {
                                 eprintln!(
                                     "[AudioEngine] failed to load project source {:?}: {err}",
@@ -869,7 +931,7 @@ impl AudioEngine {
                         }
                     }
                 }
-                let Some(source) = control.project_sources.get(&clip.source_file_id).cloned()
+                let Some(source) = control.project_sources.get(&effective_id).cloned()
                 else {
                     continue;
                 };
@@ -915,6 +977,35 @@ impl AudioEngine {
             patterns_channel_index: project
                 .patterns_bus_id
                 .and_then(|id| channel_index.get(&id).copied()),
+        })
+    }
+
+    /// Nombre total d'erreurs du callback stream — >0 persistant = device mort.
+    pub fn stream_error_count(&self) -> u64 {
+        self.stream_errors.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Charge temps réel du callback : voix actives / pic, durée du dernier
+    /// callback et du pire, taille du buffer (pour le ratio de charge).
+    pub fn load_snapshot(&self) -> serde_json::Value {
+        let voices = self.load_stats.voices_active.load(Ordering::Relaxed);
+        let peak = self.load_stats.voices_peak.load(Ordering::Relaxed);
+        let last = self.load_stats.cb_nanos_last.load(Ordering::Relaxed);
+        let max = self.load_stats.cb_nanos_max.load(Ordering::Relaxed);
+        let frames = self.load_stats.buffer_frames.load(Ordering::Relaxed);
+        let budget_ns = if frames > 0 && self.sample_rate > 0.0 {
+            (frames as f64 / self.sample_rate as f64 * 1.0e9) as u64
+        } else {
+            0
+        };
+        serde_json::json!({
+            "voices": voices,
+            "voices_peak": peak,
+            "callback_us_last": last / 1000,
+            "callback_us_max": max / 1000,
+            "buffer_us": budget_ns / 1000,
+            "load_pct_last": if budget_ns > 0 { last * 100 / budget_ns } else { 0 },
+            "load_pct_max": if budget_ns > 0 { max * 100 / budget_ns } else { 0 },
         })
     }
 
@@ -1226,6 +1317,15 @@ impl AudioEngine {
         let roots = sample_roots(main_root);
         match load_sample_library_merged(&roots) {
             Ok(lib) => {
+                // Parse du soundfont HORS du lock : ~140 Mo → plusieurs secondes,
+                // bloquerait l'audio callback et l'UI qui attendent `control`.
+                let sf = find_soundfont_in_dir(main_root).and_then(|sf_path| {
+                    let sf = soundfont::load_soundfont(&sf_path);
+                    if sf.is_some() {
+                        eprintln!("[AudioEngine] GM soundfont loaded from {:?}", sf_path);
+                    }
+                    sf
+                });
                 if let Ok(mut state) = self.control.lock() {
                     eprintln!(
                         "[AudioEngine] reloaded sample library ({} roots, {} entries)",
@@ -1234,11 +1334,8 @@ impl AudioEngine {
                     );
                     state.library = lib;
                     state.missing_logged.clear();
-                    if let Some(sf_path) = find_soundfont_in_dir(main_root) {
-                        if let Some(sf) = soundfont::load_soundfont(&sf_path) {
-                            state.soundfont = Some(sf);
-                            eprintln!("[AudioEngine] GM soundfont loaded from {:?}", sf_path);
-                        }
+                    if let Some(sf) = sf {
+                        state.soundfont = Some(sf);
                     }
                 }
                 self.clear();
@@ -1255,8 +1352,10 @@ impl AudioEngine {
         key: &SampleKey,
         variant: Option<usize>,
     ) -> Option<std::sync::Arc<[f32]>> {
+        // try_lock : appelé par frame dans la timeline — si `control` est tenu
+        // (callback audio, reload), on saute la frame plutôt que de geler l'UI.
         self.control
-            .lock()
+            .try_lock()
             .ok()?
             .library
             .get_waveform_preview(key, variant)
@@ -1374,6 +1473,15 @@ impl AudioEngine {
             let roots = sample_roots(&root);
             match load_sample_library_merged(&roots) {
                 Ok(lib) => {
+                    // Soundfont parsé hors du lock (140 Mo → secondes ; le lock
+                    // tenu aussi longtemps gelait UI + callback audio).
+                    let sf = find_soundfont_in_dir(&root).and_then(|sf_path| {
+                        let sf = soundfont::load_soundfont(&sf_path);
+                        if sf.is_some() {
+                            eprintln!("[AudioEngine] GM soundfont loaded from {:?}", sf_path);
+                        }
+                        sf
+                    });
                     if let Ok(mut s) = control.lock() {
                         eprintln!(
                             "[AudioEngine] reloaded sample library ({} roots, {} entries)",
@@ -1382,11 +1490,8 @@ impl AudioEngine {
                         );
                         s.library = lib;
                         s.missing_logged.clear();
-                        if let Some(sf_path) = find_soundfont_in_dir(&root) {
-                            if let Some(sf) = soundfont::load_soundfont(&sf_path) {
-                                s.soundfont = Some(sf);
-                                eprintln!("[AudioEngine] GM soundfont loaded from {:?}", sf_path);
-                            }
+                        if let Some(sf) = sf {
+                            s.soundfont = Some(sf);
                         }
                     }
                     // НЕ слать AudioCommand::Clear: это убивает все уже запланированные voice'ы,

@@ -3,6 +3,7 @@
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -23,7 +24,8 @@ use crate::audio_recording::{RecordingController, RecordingFinalize, RecordingRe
 use crate::offline_export;
 use crate::pattern_ir::{PatternDocument, PatternIr};
 use crate::project_audio::{
-    AudioTrackId, Fade, FadeCurve, FxSlot, ProjectAudioState, RecordingSessionInfo,
+    AudioClipId, AudioSource, AudioTrackId, Fade, FadeCurve, FadeEdge, FxSlot,
+    ProjectAudioState, RecordingSessionInfo,
 };
 use crate::sample_loader::SampleKey;
 use crate::waveform_cache::WaveformPeak;
@@ -32,6 +34,72 @@ use std::time::{Duration, Instant};
 
 const REVERSE_SEEK_BATCH_WINDOW_CYCLES: f64 = 0.12;
 const REVERSE_SEEK_MIN_INTERVAL: Duration = Duration::from_millis(90);
+
+/// État miroir écrit par le thread UI et lu par `sched-tick` — le worker qui
+/// continue le scheduling audio quand l'UI est gelée (fenêtre occluse).
+/// Les f64 transitent en bits dans des atomics (monotonicité non garantie
+/// sous concurrence, mais les deux écrivains sont mutuellement exclusifs en
+/// pratique : le worker n'agit que quand le heartbeat UI est mort).
+struct SchedShared {
+    playing: AtomicBool,
+    paused: AtomicBool,
+    reverse: AtomicBool,
+    audio_enabled: AtomicBool,
+    /// Dernier `current_time` vu par l'UI (cycles) + instant de cette écriture.
+    current_time: AtomicU64,
+    current_time_at: std::sync::Mutex<Instant>,
+    /// CPS courant (cycles/seconde) pour avancer le temps pendant le gel.
+    cps: AtomicU64,
+    /// settings.audio_gain — appliqué aux voix schedulées par le worker.
+    audio_gain: AtomicU64,
+    session_start: AtomicU64,
+    /// Borne déjà schedulée (cycles) — source de vérité unique UI+worker.
+    last_scheduled_to: AtomicU64,
+    /// Moteur audio courant (peut être remplacé lors d'une reconstruction async).
+    engine: std::sync::Mutex<Option<Arc<AudioEngine>>>,
+}
+
+impl SchedShared {
+    fn new() -> Self {
+        Self {
+            playing: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            reverse: AtomicBool::new(false),
+            audio_enabled: AtomicBool::new(true),
+            current_time: AtomicU64::new(0),
+            current_time_at: std::sync::Mutex::new(Instant::now()),
+            cps: AtomicU64::new(1.0f64.to_bits()),
+            audio_gain: AtomicU64::new(1.0f64.to_bits()),
+            session_start: AtomicU64::new(0),
+            last_scheduled_to: AtomicU64::new((-1.0f64).to_bits()),
+            engine: std::sync::Mutex::new(None),
+        }
+    }
+    fn get_f64(a: &AtomicU64) -> f64 {
+        f64::from_bits(a.load(Ordering::Relaxed))
+    }
+    fn set_f64(a: &AtomicU64, v: f64) {
+        a.store(v.to_bits(), Ordering::Relaxed);
+    }
+    fn scheduled_to(&self) -> f64 {
+        Self::get_f64(&self.last_scheduled_to)
+    }
+    fn set_scheduled_to(&self, v: f64) {
+        Self::set_f64(&self.last_scheduled_to, v);
+    }
+    /// Temps courant estimé : le dernier vu par l'UI + dérive au cps courant.
+    /// Correct tant que l'UI écrivait avant de geler (fenêtre occluse).
+    fn current_estimate(&self) -> f64 {
+        let base = Self::get_f64(&self.current_time);
+        let cps = Self::get_f64(&self.cps).max(0.01);
+        let elapsed = self
+            .current_time_at
+            .lock()
+            .map(|i| i.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        base + elapsed * cps
+    }
+}
 
 pub struct StruidelApp {
     bridge: StrudelBridge,
@@ -58,12 +126,34 @@ pub struct StruidelApp {
     menu_dropdown_anchor: Option<egui::Rect>,
     save_as_requested: bool,
     audio: Option<Arc<AudioEngine>>,
+    /// Init audio en cours (l'énumération ALSA + open du device peut prendre des
+    /// secondes — jamais sur le thread UI). Receveur rempli par un thread dédié.
+    pending_audio_engine: Option<mpsc::Receiver<Result<Arc<AudioEngine>, String>>>,
+    /// Heartbeat du thread UI (millis epoch SystemTime) + « l'UI est censée
+    /// ticker » (lecture/enregistrement/init). Un thread `ui-watchdog` relaie
+    /// un blocage prolongé vers les notifications freedesktop (panneau Quickshell).
+    ui_heartbeat: Arc<AtomicU64>,
+    ui_expect_ticks: Arc<AtomicBool>,
+    /// Vrai quand l'UI est occupée à fond (lecture active etc.) — utilisé par le
+    /// watchdog pour détailler la notif.
+    ui_busy_label: Arc<std::sync::Mutex<String>>,
+    /// One-shot de diagnostic : ms de sommeil à consommer dans update() pour
+    /// simuler un gel UI (env STRUIDEL_DEBUG_STALL_MS).
+    debug_ui_stall_ms: Arc<AtomicU64>,
+    /// Rendus FX de clip en cours (bitcrush, gate, comp…) — chaque receveur
+    /// rend une source dérivée installée comme `fx_source_file_id`.
+    pending_clip_fx_renders: Vec<ClipFxRenderRx>,
+    /// Révision par clip : un rendu fini plus vieux que la révision courante
+    /// est jeté (l'utilisateur a continué de bouger les sliders).
+    clip_fx_rev: HashMap<AudioClipId, u64>,
     /// API de contrôle locale (MCP struidel) : requêtes HTTP dépilées par frame.
     control: crate::control_api::ControlApi,
     /// Dernière publication du statut de contrôle (~4 Hz).
     control_status_at: Instant,
-    /// Граница уже запланированного аудио (в циклах Strudel). Чтобы не планировать одни и те же события каждый кадр.
-    last_scheduled_to: f64,
+    /// État de scheduling partagé avec le thread `sched-tick` : quand le thread
+    /// UI est gelé (fenêtre occluse — Wayland suspend les frame callbacks), ce
+    /// worker prend le relais pour que l'audio et l'API continuent.
+    sched: Arc<SchedShared>,
     /// CPS из последнего audio_window — для интерполяции времени при воспроизведении.
     last_cps: f64,
     /// Время из последнего ответа bridge.now() и момент получения — для плавной интерполяции.
@@ -209,8 +299,8 @@ pub struct StruidelApp {
     arrangement_last_active: Option<String>,
     /// Нативный движок для простых s("...")/sound("...") паттернов —
     /// синтезирует audio_window прямо в Rust и обходит node.js bridge,
-    /// устраняя задержку первого цикла.
-    native_engine: crate::native_engine::NativeEngine,
+    /// устраняя задержку первого цикла. Partagé avec le thread sched-tick.
+    native_engine: Arc<std::sync::Mutex<crate::native_engine::NativeEngine>>,
     /// Visual Stage (browser Hydra) + WS event fan-out.
     visual_stage: VisualStage,
     /// Chain Seed panel state (NFT / on-chain → Strudel).
@@ -289,6 +379,43 @@ const SYNTH_SOUNDS: &[&str] = &[
 /// Percussions synthétisées (type 808/909) — accordage interne, `.speed()` pour altérer.
 const DRUM_SOUNDS: &[&str] =
     &["synthbd", "synthsd", "synthhh", "synthoh", "synthcp"];
+
+/// Receveur d'un rendu FX de clip : (clip_id, révision, résultat WAV).
+type ClipFxRenderRx =
+    mpsc::Receiver<(AudioClipId, u64, Result<(PathBuf, u32, u16, u64), String>)>;
+
+/// Millisecondes depuis l'epoch Unix (heartbeat du watchdog UI).
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Envoie une notification freedesktop — reçue par le NotificationServer de
+/// Quickshell et affichée dans le panneau notifs de la sidebar droite.
+/// Fire-and-forget : un helper thread récolte l'enfant pour éviter les zombies.
+fn ui_watchdog_notify(urgency: &str, summary: &str, body: &str) {
+    let spawn = std::process::Command::new("notify-send")
+        .args([
+            "-a",
+            "struIDEl",
+            "-u",
+            urgency,
+            "-i",
+            "dialog-warning",
+            summary,
+            body,
+        ])
+        .spawn();
+    if let Ok(mut child) = spawn {
+        let _ = std::thread::Builder::new()
+            .name("notify-reap".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+    }
+}
 
 /// Suffixe de contrôles inline ajouté à un son inséré quand « contrôles » est
 /// coché : widgets live directement dans le code — `slider(v,min,max)` donne
@@ -475,17 +602,172 @@ impl StruidelApp {
                 eprintln!("[StruidelApp] DocStore is None");
             }
         }
-        let audio = if settings.audio_enabled {
-            AudioEngine::new().ok().map(Arc::new)
+        // Init audio hors du thread UI : l'énumération ALSA + l'ouverture du
+        // device (Bluetooth/PipeWire inclus) peut prendre plusieurs secondes.
+        let pending_audio_engine = if settings.audio_enabled {
+            let (tx, rx) = mpsc::channel();
+            std::thread::Builder::new()
+                .name("audio-init".to_string())
+                .spawn(move || {
+                    let _ = tx.send(AudioEngine::new().map(Arc::new));
+                })
+                .ok()
+                .map(|_| rx)
         } else {
             None
         };
         let audio_project = ProjectAudioState::default();
         let mut sync_engine = SyncEngine::default();
         sync_engine.set_project_audio_state(&audio_project);
+        let bridge = StrudelBridge::default();
+        // sched-tick : reprend le scheduling audio quand le thread UI est gelé
+        // (fenêtre occluse → Wayland suspend les frame callbacks → update() ne
+        // tourne plus → sans ce worker, l'audio meurt ~1 s après avoir caché
+        // la fenêtre). L'UI écrit son état dans `sched` à chaque frame ; le
+        // worker n'agit QUE si le heartbeat UI est mort depuis >1,6 s.
+        let sched_shared = Arc::new(SchedShared::new());
+        let native_engine = Arc::new(std::sync::Mutex::new(
+            crate::native_engine::NativeEngine::new(),
+        ));
+
+        // Watchdog « ne répond plus » : si le thread UI cesse de ticker alors
+        // qu'il est censé le faire (lecture, enregistrement, init audio…),
+        // on relaie l'ANR vers les notifications freedesktop → elles atterrissent
+        // dans le panneau notifs de Quickshell avec le programme et le détail.
+        let ui_heartbeat = Arc::new(AtomicU64::new(now_millis()));
+        let ui_expect_ticks = Arc::new(AtomicBool::new(false));
+        let ui_busy_label = Arc::new(std::sync::Mutex::new(String::new()));
+        // Diagnostic : STRUIDEL_DEBUG_STALL_MS=<ms> fait dormir une fois le
+        // thread UI dans update() pour reproduire un gel et tester le watchdog.
+        let debug_ui_stall_ms = Arc::new(AtomicU64::new(
+            std::env::var("STRUIDEL_DEBUG_STALL_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0),
+        ));
+        {
+            let beat = ui_heartbeat.clone();
+            let expect = ui_expect_ticks.clone();
+            let label = ui_busy_label.clone();
+            let _ = std::thread::Builder::new()
+                .name("ui-watchdog".into())
+                .spawn(move || {
+                    let mut stalled = false;
+                    loop {
+                        thread::sleep(Duration::from_millis(500));
+                        let age = now_millis().saturating_sub(beat.load(Ordering::Relaxed));
+                        if !expect.load(Ordering::Relaxed) {
+                            // UI parquée en attente d'événements = sain (répond aux pings).
+                            stalled = false;
+                            continue;
+                        }
+                        if !stalled && age > 4_000 {
+                            stalled = true;
+                            let what = label
+                                .lock()
+                                .map(|s| s.clone())
+                                .unwrap_or_default();
+                            let detail = if what.is_empty() {
+                                format!("UI bloquée depuis {} s", age / 1000)
+                            } else {
+                                format!("UI bloquée depuis {} s ({})", age / 1000, what)
+                            };
+                            ui_watchdog_notify(
+                                "critical",
+                                "« struidel » ne répond plus",
+                                &format!("{}\nVérifiez audio/Bluetooth — le thread UI est saturé.", detail),
+                            );
+                        } else if stalled && age <= 4_000 {
+                            stalled = false;
+                            ui_watchdog_notify(
+                                "normal",
+                                "« struidel » répond à nouveau",
+                                &format!("Récupéré après un blocage UI d'environ {} s.", age.max(1) / 1000),
+                            );
+                        }
+                    }
+                });
+        }
+        {
+            // sched-tick : reprend le scheduling audio quand le thread UI est
+            // gelé (fenêtre occluse — Wayland suspend les frame callbacks et
+            // update() ne tourne plus). L'UI écrit son état dans `sched` à
+            // chaque frame ; le worker n'agit QUE si le heartbeat est mort
+            // depuis >1,6 s. Reverse ignoré : cas rare, l'audio s'arrête
+            // simplement au lieu d'être mal schedulé.
+            let sched = sched_shared.clone();
+            let beat = ui_heartbeat.clone();
+            let native = native_engine.clone();
+            let bridge_tx = bridge.command_sender();
+            let _ = std::thread::Builder::new()
+                .name("sched-tick".into())
+                .spawn(move || loop {
+                    thread::sleep(Duration::from_millis(90));
+                    let age = now_millis().saturating_sub(beat.load(Ordering::Relaxed));
+                    if age < 1600
+                        || !sched.playing.load(Ordering::Relaxed)
+                        || sched.paused.load(Ordering::Relaxed)
+                        || sched.reverse.load(Ordering::Relaxed)
+                        || !sched.audio_enabled.load(Ordering::Relaxed)
+                    {
+                        continue;
+                    }
+                    let from = sched.current_estimate();
+                    let to = from + 0.5;
+                    let scheduled_up_to = sched.scheduled_to();
+                    if to <= scheduled_up_to || (scheduled_up_to - from) > 1.5 {
+                        continue;
+                    }
+                    let pure = native.lock().map(|e| e.is_pure()).unwrap_or(false);
+                    let result = if pure {
+                        native.lock().map(|e| e.query_audio_window(from, to)).ok()
+                    } else {
+                        bridge_tx
+                            .as_ref()
+                            .and_then(|tx| tx.audio_window(from, to, Duration::from_millis(500)).ok())
+                    };
+                    let Some(result) = result else { continue };
+                    eprintln!(
+                        "[sched-tick] relais gel : {} événements [{from:.2}→{to:.2}]",
+                        result.events.len()
+                    );
+                    sched.set_scheduled_to(to);
+                    SchedShared::set_f64(&sched.cps, result.cps);
+                    let engine = sched.engine.lock().ok().and_then(|e| e.clone());
+                    let Some(engine) = engine else { continue };
+                    let audio_gain = SchedShared::get_f64(&sched.audio_gain);
+                    let ref_cycle = sched.current_estimate();
+                    for ev in result.events {
+                        if ev.begin < scheduled_up_to {
+                            continue;
+                        }
+                        let gain = (ev.gain.unwrap_or(1.0) * audio_gain).clamp(0.0, 1.0);
+                        engine.schedule_event(AudioEvent {
+                            start_cycle: ev.begin - ref_cycle,
+                            end_cycle: ev.end - ref_cycle,
+                            midi_note: ev.midi,
+                            gain: Some(gain),
+                            cps: result.cps,
+                            s: ev.s,
+                            bank: ev.bank,
+                            n: ev.n,
+                            pan: ev.pan,
+                            attack: ev.attack,
+                            decay: ev.decay,
+                            sustain: ev.sustain,
+                            release: ev.release,
+                            room: ev.room,
+                            shape: ev.shape,
+                            cut: ev.cut,
+                            speed: ev.speed,
+                            cutoff: ev.cutoff,
+                        });
+                    }
+                });
+        }
 
         Self {
-            bridge: StrudelBridge::default(),
+            bridge,
             root_layout: LayoutNode::default_layout(),
             editor_tabs: Vec::new(),
             active_editor_index: 0,
@@ -502,10 +784,21 @@ impl StruidelApp {
             open_top_menu: None,
             menu_dropdown_anchor: None,
             save_as_requested: false,
-            audio,
-            control: crate::control_api::ControlApi::start(),
+            audio: None,
+            pending_audio_engine,
+            ui_heartbeat: ui_heartbeat.clone(),
+            ui_expect_ticks,
+            ui_busy_label,
+            debug_ui_stall_ms,
+            pending_clip_fx_renders: Vec::new(),
+            clip_fx_rev: HashMap::new(),
+            control: {
+                let api = crate::control_api::ControlApi::start();
+                api.set_heartbeat(ui_heartbeat.clone());
+                api
+            },
             control_status_at: Instant::now() - Duration::from_secs(1),
-            last_scheduled_to: -1.0,
+            sched: sched_shared.clone(),
             last_cps: 1.0,
             last_bridge_now: 0.0,
             last_bridge_instant: Instant::now(),
@@ -577,7 +870,7 @@ impl StruidelApp {
             arrangement_view: ui::ArrangementViewState::default(),
             arrangement_active_code: String::new(),
             arrangement_last_active: None,
-            native_engine: crate::native_engine::NativeEngine::new(),
+            native_engine: native_engine.clone(),
             visual_stage: {
                 let vs = VisualStage::new();
                 vs.ensure_running();
@@ -1041,13 +1334,13 @@ impl StruidelApp {
     fn refresh_native_engine(&mut self) {
         let bpm = self.transport_state.bpm;
         if let Some(doc) = self.pattern_document.as_ref() {
-            let pure = self.native_engine.update(doc, bpm);
+            let pure = self.native_engine.lock().map(|mut e| e.update(doc, bpm)).unwrap_or(false);
             // Прогреваем кэш сэмплов в фоне: без этого первый schedule_event для нового
             // сэмпла выполнит синхронный load_wav_sample в UI thread, voice опоздает
             // в render thread и первый удар «съедается» по t > end_time.
             if pure {
                 if let Some(engine) = &self.audio {
-                    let requests = self.native_engine.sample_requests();
+                    let requests = self.native_engine.lock().map(|e| e.sample_requests()).unwrap_or_default();
                     engine.prewarm_samples(requests);
                 }
             }
@@ -1061,7 +1354,7 @@ impl StruidelApp {
                 source_map: crate::pattern_ir::SourceMap::default(),
                 diagnostics: Vec::new(),
             };
-            let _ = self.native_engine.update(&empty, bpm);
+            if let Ok(mut e) = self.native_engine.lock() { let _ = e.update(&empty, bpm); }
         }
     }
 
@@ -1076,7 +1369,7 @@ impl StruidelApp {
             engine.clear();
         }
         self.pending_audio = None;
-        self.last_scheduled_to = -1.0;
+        self.sched.set_scheduled_to(-1.0);
         self.example_display_time = 0.0;
         // Восстанавливаем позицию основной шкалы, которую заморозили на момент запуска example.
         if let Some(t) = restore {
@@ -1128,7 +1421,7 @@ impl StruidelApp {
             } else {
                 self.playing = true;
                 self.paused = false;
-                self.last_scheduled_to = -1.0;
+                self.sched.set_scheduled_to(-1.0);
                 self.reload_samples_after_eval = true;
                 if let Some(ed) = self.active_editor_mut() {
                     ed.eval_error = None;
@@ -1137,13 +1430,14 @@ impl StruidelApp {
                     ed.flash_until = Some(Instant::now() + Duration::from_millis(200));
                 }
                 // Гарантируем, что AudioEngine создан — нативный путь без него не работает.
+                // Init async : l'ouverture du device peut prendre des secondes.
                 if self.settings.audio_enabled && self.audio.is_none() {
-                    self.audio = AudioEngine::new().ok().map(Arc::new);
+                    self.request_audio_engine(0);
                 }
                 // Синхронный прогрев сэмплов ДО первого schedule_audio_window:
                 // первый удар иначе будет ждать фоновый prewarm и «съедаться» retain'ом.
                 if let Some(engine) = &self.audio {
-                    let requests = self.native_engine.sample_requests();
+                    let requests = self.native_engine.lock().map(|e| e.sample_requests()).unwrap_or_default();
                     if !requests.is_empty() {
                         engine.prewarm_samples_blocking(requests);
                     }
@@ -1203,7 +1497,7 @@ impl StruidelApp {
         }
         self.playing = true;
         self.paused = false;
-        self.last_scheduled_to = -1.0;
+        self.sched.set_scheduled_to(-1.0);
         self.reload_samples_after_eval = true;
     }
 
@@ -1218,7 +1512,7 @@ impl StruidelApp {
         match rx.try_recv() {
             Ok(Ok(result)) => {
                 self.pending_audio = None;
-                let scheduled_up_to = self.last_scheduled_to;
+                let scheduled_up_to = self.sched.scheduled_to();
                 self.last_cps = result.cps;
                 // Первый ответ после свежего запуска — «отпускаем» интерполяцию времени
                 // и выравниваем last_bridge_instant, чтобы первые события не уехали в прошлое.
@@ -1227,7 +1521,7 @@ impl StruidelApp {
                     self.last_bridge_instant = Instant::now();
                     self.last_bridge_now = self.current_time;
                 }
-                self.last_scheduled_to = if reverse_request { from } else { to };
+                self.sched.set_scheduled_to(if reverse_request { from } else { to });
                 // Привязка к текущему циклу в момент ответа, а не к from: иначе переменная задержка
                 // ответа (20–100 ms) даёт разный сдвиг по фазе и скачки.
                 let ref_cycle = self.current_time;
@@ -1345,10 +1639,10 @@ impl StruidelApp {
             if current <= session_start {
                 return;
             }
-            if self.last_scheduled_to < 0.0 || self.last_scheduled_to > current + 0.75 {
-                self.last_scheduled_to = current;
+            if self.sched.scheduled_to() < 0.0 || self.sched.scheduled_to() > current + 0.75 {
+                self.sched.set_scheduled_to(current);
             }
-            let boundary = self.last_scheduled_to.min(current);
+            let boundary = self.sched.scheduled_to().min(current);
             if current - boundary > 1.5 {
                 return;
             }
@@ -1360,7 +1654,7 @@ impl StruidelApp {
         } else {
             let from = self.current_time;
             let to = from + 0.5;
-            let scheduled_up_to = self.last_scheduled_to;
+            let scheduled_up_to = self.sched.scheduled_to();
             if to <= scheduled_up_to || (scheduled_up_to - from) > 1.5 {
                 return;
             }
@@ -1370,8 +1664,15 @@ impl StruidelApp {
         // минуем node.js bridge и сразу кладём результат в pending_audio через mpsc::channel.
         // poll_pending_audio на следующем кадре подхватит и зашедулит в AudioEngine.
         // Reverse-путь остаётся за bridge — он в нём реализован.
-        if self.native_engine.is_pure() && !reverse_request {
-            let result = self.native_engine.query_audio_window(from, to);
+        if self.native_engine.lock().map(|e| e.is_pure()).unwrap_or(false) && !reverse_request {
+            let result = self
+                .native_engine
+                .lock()
+                .map(|e| e.query_audio_window(from, to))
+                .unwrap_or_else(|_| crate::strudel_bridge::AudioWindowResult {
+                    cps: 1.0,
+                    events: Vec::new(),
+                });
             let (tx, rx) = std::sync::mpsc::channel();
             let _ = tx.send(Ok(result));
             self.pending_audio = Some((from, to, reverse_request, rx));
@@ -2267,12 +2568,23 @@ impl StruidelApp {
             "bpm": self.transport_state.bpm,
             "cps": self.transport_state.bpm / 60.0,
             "time_cycles": self.current_time,
-            "engine": if self.native_engine.is_pure() { "native" } else { "bridge" },
+            "engine": if self.native_engine.lock().map(|e| e.is_pure()).unwrap_or(false) { "native" } else { "bridge" },
             "file": file,
             "code_len": code.len(),
             "audio_engine": self.audio.is_some(),
+            "audio_load": self.audio.as_ref().map(|e| e.load_snapshot()),
             "meter": meter,
             "last_error": self.bridge.last_error(),
+            "timeline": {
+                "clips": self.audio_project.tracks.iter().map(|t| t.clips.len()).sum::<usize>(),
+                "selected_clip": self.audio_project.selected_clip,
+                "selected_clip_fx": self.audio_project.selected_clip
+                    .and_then(|id| self.audio_project.clip(id))
+                    .map(|c| serde_json::json!({
+                        "voice_fx": c.voice_fx.is_some(),
+                        "fx_source": c.fx_source_file_id.is_some(),
+                    })),
+            },
         })
     }
 
@@ -2347,6 +2659,69 @@ impl StruidelApp {
                 }
             }
             "param" => self.control_set_param(body),
+            // Insère un fichier audio (typiquement une prise dans recordings/)
+            // comme clip sur la piste sélectionnée — permet aussi au MCP de
+            // poser des prises sur la timeline.
+            "add_take_clip" => {
+                let Some(path_str) = body.get("path").and_then(|p| p.as_str()) else {
+                    return json!({"ok": false, "error": "champ \"path\" manquant"});
+                };
+                let path = PathBuf::from(path_str);
+                if !path.exists() {
+                    return json!({"ok": false, "error": format!("fichier absent: {path_str}")});
+                }
+                let Some(track_id) = self.audio_project.selected_track else {
+                    return json!({"ok": false, "error": "pas de piste sélectionnée"});
+                };
+                match crate::audio_clip_engine::load_audio_file(&path) {
+                    Ok(audio) => {
+                        let frames = audio.frames() as u64;
+                        let secs =
+                            audio.frames() as f64 / audio.sample_rate.max(1) as f64;
+                        let cycles = secs * self.last_cps.max(0.001);
+                        let source = AudioSource {
+                            id: 0,
+                            path,
+                            sample_rate: audio.sample_rate,
+                            channels: audio.channels,
+                            frames,
+                            created_by_recording: true,
+                            latency_compensation_frames: 0,
+                            peak_path: None,
+                        };
+                        let source_id = self.audio_project.add_source(source);
+                        let start = self
+                            .audio_project
+                            .tracks
+                            .iter()
+                            .find(|t| t.id == track_id)
+                            .map(|t| {
+                                t.clips.iter().map(|c| c.end()).fold(0.0, f64::max)
+                            })
+                            .unwrap_or(0.0);
+                        let clip_id = self.audio_project.insert_recording_clip(
+                            track_id,
+                            source_id,
+                            start,
+                            cycles.max(0.25),
+                        );
+                        self.sync_audio_mixer_runtime();
+                        json!({"ok": true, "clip_id": clip_id, "cycles": cycles})
+                    }
+                    Err(err) => json!({"ok": false, "error": err}),
+                }
+            }
+            "remove_clip" => {
+                let Some(clip_id) = body.get("clip_id").and_then(|c| c.as_u64()) else {
+                    return json!({"ok": false, "error": "champ \"clip_id\" manquant"});
+                };
+                if self.audio_project.delete_clip(clip_id as AudioClipId, false) {
+                    self.sync_audio_mixer_runtime();
+                    json!({"ok": true})
+                } else {
+                    json!({"ok": false, "error": format!("clip introuvable: {clip_id}")})
+                }
+            }
             "meter" => {
                 let Some(engine) = &self.audio else {
                     return json!({"ok": false, "error": "pas de moteur audio"});
@@ -2667,7 +3042,7 @@ impl StruidelApp {
                     self.example_playback.mark_started(code);
                     self.playing = true;
                     self.paused = false;
-                    self.last_scheduled_to = -1.0;
+                    self.sched.set_scheduled_to(-1.0);
                     self.reload_samples_after_eval = true;
                 }
             }
@@ -2819,7 +3194,7 @@ impl StruidelApp {
         let meters = self.audio_recording.meters();
         let recording_active = self.audio_recording.is_recording();
         let finalizing_recording = self.pending_recording_finalize.is_some();
-        let input_devices = RecordingController::input_devices();
+        let input_devices = RecordingController::input_devices_cached();
         // Во время проигрывания example аудио-таймлайн не должен ехать,
         // а курсор остаётся в той же позиции, в которой был до запуска example.
         let timeline_playing = self.playing && !self.example_playback.is_active();
@@ -2839,6 +3214,7 @@ impl StruidelApp {
             &self.settings.voice_fx,
             |source_id| self.waveform_peaks.get(&source_id).cloned(),
             &mut self.audio_timeline_view,
+            self.last_cps,
         );
         for action in actions {
             self.handle_audio_timeline_action(action);
@@ -2975,6 +3351,26 @@ impl StruidelApp {
             ui::AudioTimelineAction::SetVoiceFx(vfx) => {
                 self.settings.voice_fx = vfx;
                 settings::save_settings(&self.settings);
+            }
+            ui::AudioTimelineAction::SetClipVoiceFx(clip_id, fx) => {
+                if let Some(clip) = self.audio_project.clip_mut(clip_id) {
+                    clip.voice_fx = Some(fx);
+                }
+                self.request_clip_fx_render(clip_id);
+                self.sync_audio_mixer_runtime();
+            }
+            ui::AudioTimelineAction::SetClipGainDb(clip_id, db) => {
+                if let Some(clip) = self.audio_project.clip_mut(clip_id) {
+                    clip.gain = crate::mixer_dsp::db_to_gain(db);
+                }
+                self.sync_audio_mixer_runtime();
+            }
+            ui::AudioTimelineAction::SetClipFadeSecs(clip_id, edge, secs, curve) => {
+                let cycles = (secs.max(0.0) as f64) * self.last_cps.max(0.001);
+                let _ = self
+                    .audio_project
+                    .set_clip_fade(clip_id, edge, cycles, Some(curve));
+                self.sync_audio_mixer_runtime();
             }
             ui::AudioTimelineAction::BounceSession => {
                 if let Some(path) = rfd::FileDialog::new()
@@ -3254,10 +3650,185 @@ impl StruidelApp {
             return;
         }
         restore_bt_profile(saved);
-        // Laisse PipeWire recréer le sink A2DP avant de rouvrir le device.
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        // Laisse PipeWire recréer le sink A2DP avant de rouvrir le device —
+        // le délai + l'init se font sur le thread audio-init, pas sur l'UI.
         if self.settings.audio_enabled {
-            self.audio = AudioEngine::new().ok().map(Arc::new);
+            self.audio = None;
+            self.request_audio_engine(400);
+        }
+    }
+
+    /// Lance l'init de l'engine audio en arrière-plan (`delay_ms` d'attente
+    /// préalable, ex. laisser PipeWire recréer le sink A2DP). Résultat dans
+    /// `pending_audio_engine`, ramassé par `poll_pending_audio_engine`.
+    fn request_audio_engine(&mut self, delay_ms: u64) {
+        if self.audio.is_some() || self.pending_audio_engine.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ok = std::thread::Builder::new()
+            .name("audio-init".to_string())
+            .spawn(move || {
+                if delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                }
+                let _ = tx.send(AudioEngine::new().map(Arc::new));
+            })
+            .is_ok();
+        if ok {
+            self.pending_audio_engine = Some(rx);
+        }
+    }
+
+    /// Un stream dont le device est mort (BT off, PipeWire relancé…) accumule
+    /// des POLLERR sans jamais guérir : on le jette et on reconstruit l'engine
+    /// en arrière-plan — même chemin que l'init, rien sur le thread UI.
+    fn poll_dead_audio_stream(&mut self) {
+        let Some(engine) = &self.audio else {
+            return;
+        };
+        if engine.stream_error_count() < 50 {
+            return;
+        }
+        eprintln!("[audio] stream mort ({} erreurs) — reconstruction de l'engine",
+            engine.stream_error_count());
+        self.audio = None; // drop du stream → fin du callback en erreur
+        self.request_audio_engine(750);
+    }
+
+    /// Ramasse l'engine audio prête (init faite en arrière-plan).
+    fn poll_pending_audio_engine(&mut self) {
+        let Some(rx) = &self.pending_audio_engine else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(engine)) => {
+                eprintln!("[audio] engine prête (init async)");
+                self.audio = Some(engine);
+                self.pending_audio_engine = None;
+            }
+            Ok(Err(e)) => {
+                eprintln!("[audio] init engine échouée: {e}");
+                self.pending_audio_engine = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending_audio_engine = None;
+            }
+        }
+    }
+
+    /// Cache des sources dérivées FX : caché dans la racine des samples
+    /// (`.fx-cache/` — les dossiers cachés ne sont pas indexés en banque).
+    fn clip_fx_cache_dir(&self) -> PathBuf {
+        self.root_folder
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(&self.settings.sample_folder))
+            .join(".fx-cache")
+    }
+
+    /// Démarre un rendu des FX « lourds » du clip en arrière-plan, ou revient
+    /// à la source d'origine si tout est à off. Jamais de DSP sur le thread UI.
+    fn request_clip_fx_render(&mut self, clip_id: AudioClipId) {
+        let Some(clip) = self.audio_project.clip(clip_id) else {
+            return;
+        };
+        let Some(fx) = clip.voice_fx.clone() else {
+            return;
+        };
+        let Some(src) = self
+            .audio_project
+            .pool
+            .sources
+            .get(&clip.source_file_id)
+        else {
+            return;
+        };
+        if !fx.needs_render(src.sample_rate) {
+            if let Some(clip) = self.audio_project.clip_mut(clip_id) {
+                clip.fx_source_file_id = None;
+            }
+            return;
+        }
+        let rev = {
+            let r = self.clip_fx_rev.entry(clip_id).or_insert(0);
+            *r = r.saturating_add(1);
+            *r
+        };
+        let path = src.path.clone();
+        let out_dir = self.clip_fx_cache_dir();
+        let (tx, rx) = mpsc::channel();
+        let _ = std::thread::Builder::new()
+            .name("clip-fx-render".into())
+            .spawn(move || {
+                let res = crate::audio_clip_engine::load_audio_file(&path)
+                    .and_then(|mut audio| {
+                        crate::voice_fx::render_clip_voice_fx(&mut audio, &fx);
+                        std::fs::create_dir_all(&out_dir)
+                            .map_err(|e| format!("create {:?}: {e}", out_dir))?;
+                        let out = out_dir.join(format!("clip-{clip_id}-r{rev}.wav"));
+                        crate::audio_clip_engine::write_wav_float(
+                            &out,
+                            &audio.samples,
+                            audio.sample_rate,
+                            audio.channels,
+                        )?;
+                        Ok((out, audio.sample_rate, audio.channels, audio.frames() as u64))
+                    });
+                let _ = tx.send((clip_id, rev, res));
+            });
+        self.pending_clip_fx_renders.push(rx);
+    }
+
+    /// Installe les sources dérivées rendues (les rendus périmés sont jetés).
+    fn poll_clip_fx_renders(&mut self) {
+        let mut i = 0;
+        while i < self.pending_clip_fx_renders.len() {
+            match self.pending_clip_fx_renders[i].try_recv() {
+                Err(mpsc::TryRecvError::Empty) => {
+                    i += 1;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_clip_fx_renders.remove(i);
+                }
+                Ok((clip_id, rev, res)) => {
+                    self.pending_clip_fx_renders.remove(i);
+                    if self.clip_fx_rev.get(&clip_id) != Some(&rev) {
+                        continue; // un réglage plus récent a relancé un rendu
+                    }
+                    match res {
+                        Ok((path, sample_rate, channels, frames)) => {
+                            let peak =
+                                crate::waveform_cache::load_or_build_peak(&path).ok();
+                            let peak_path = peak
+                                .as_ref()
+                                .map(|_| crate::waveform_cache::peak_path_for_audio(&path));
+                            let source = AudioSource {
+                                id: 0,
+                                path,
+                                sample_rate,
+                                channels,
+                                frames,
+                                created_by_recording: false,
+                                latency_compensation_frames: 0,
+                                peak_path: peak_path.clone(),
+                            };
+                            let id = self.audio_project.add_source(source);
+                            if let (Some(peak), Some(peak_path)) = (peak, peak_path) {
+                                self.audio_project.pool.peak_files.insert(id, peak_path);
+                                self.waveform_peaks.insert(id, peak);
+                            }
+                            if let Some(clip) = self.audio_project.clip_mut(clip_id) {
+                                clip.fx_source_file_id = Some(id);
+                            }
+                            self.sync_audio_mixer_runtime();
+                        }
+                        Err(err) => {
+                            eprintln!("[ClipFx] rendu clip {clip_id} échoué : {err}");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -4409,7 +4980,7 @@ impl StruidelApp {
         }
         // Отбрасываем незавершённый запрос аудио-окна
         self.pending_audio = None;
-        self.last_scheduled_to = -1.0;
+        self.sched.set_scheduled_to(-1.0);
     }
 
     fn active_source_keys_now(&self) -> std::collections::BTreeSet<ui::SourceBreakpointKey> {
@@ -4552,11 +5123,11 @@ impl StruidelApp {
 
     fn reset_audio_schedule_for_direction(&mut self) {
         self.pending_audio = None;
-        self.last_scheduled_to = if self.reverse {
+        self.sched.set_scheduled_to(if self.reverse {
             self.current_time.max(0.0)
         } else {
             (self.current_time - 0.5).max(-1.0)
-        };
+        });
         self.last_reverse_seek_at = Instant::now();
         if let Some(engine) = &self.audio {
             engine.clear();
@@ -4571,11 +5142,11 @@ impl StruidelApp {
         self.last_bridge_now = pos;
         self.last_bridge_instant = Instant::now();
         self.timeline_display_time = pos;
-        self.last_scheduled_to = if self.reverse {
+        self.sched.set_scheduled_to(if self.reverse {
             pos
         } else {
             (pos - 0.5).max(-1.0)
-        };
+        });
         self.last_reverse_seek_at = Instant::now();
         // Игнорировать ответы bridge.now() несколько кадров — пока JS-планировщик
         // не обработал seek и не вернул правильную позицию
@@ -6103,6 +6674,59 @@ impl eframe::App for StruidelApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Heartbeat watchdog : un blocage prolongé alors que l'UI est censée
+        // ticker (lecture/enregistrement/init) est relayé en notification.
+        self.ui_heartbeat.store(now_millis(), Ordering::Relaxed);
+        // Miroir pour sched-tick : le worker ne prend le relais du scheduling
+        // audio que si ce heartbeat cesse (fenêtre occluse → update() gelée).
+        self.sched.playing.store(self.playing, Ordering::Relaxed);
+        self.sched.paused.store(self.paused, Ordering::Relaxed);
+        self.sched.reverse.store(self.reverse, Ordering::Relaxed);
+        self.sched
+            .audio_enabled
+            .store(self.settings.audio_enabled, Ordering::Relaxed);
+        SchedShared::set_f64(&self.sched.current_time, self.current_time);
+        if let Ok(mut at) = self.sched.current_time_at.lock() {
+            *at = Instant::now();
+        }
+        SchedShared::set_f64(&self.sched.cps, self.last_cps);
+        SchedShared::set_f64(&self.sched.session_start, self.session_start());
+        SchedShared::set_f64(&self.sched.audio_gain, self.settings.audio_gain as f64);
+        if let Ok(mut e) = self.sched.engine.lock() {
+            *e = self.audio.clone();
+        }
+        let busy = if self.playing {
+            "lecture en cours"
+        } else if self.paused {
+            "lecture en pause"
+        } else if self.audio_recording.is_recording() {
+            "enregistrement en cours"
+        } else if self.pending_audio_engine.is_some() {
+            "initialisation du moteur audio"
+        } else if self.pending_recording_finalize.is_some() {
+            "finalisation d'enregistrement"
+        } else if self.pending_voice_export.is_some() {
+            "export voix"
+        } else {
+            ""
+        };
+        self.ui_expect_ticks
+            .store(!busy.is_empty(), Ordering::Relaxed);
+        if let Ok(mut s) = self.ui_busy_label.try_lock() {
+            if *s != busy {
+                *s = busy.to_string();
+            }
+        }
+        // Diagnostic : gel UI simulé (une fois, pendant l'activité).
+        if !busy.is_empty() {
+            let stall = self.debug_ui_stall_ms.swap(0, Ordering::Relaxed);
+            if stall > 0 {
+                thread::sleep(Duration::from_millis(stall));
+            }
+        }
+        self.poll_pending_audio_engine();
+        self.poll_dead_audio_stream();
+        self.poll_clip_fx_renders();
         self.poll_control_api(ctx);
         self.poll_chain_seed_fetch();
         self.poll_ai_pattern();
@@ -6159,7 +6783,7 @@ impl eframe::App for StruidelApp {
         //     отдаёт 0 или устаревшее время — это сбивало current_time в начале и schedule_audio_window
         //     планировало одни и те же события 2-3 раза подряд → наложение в начале.
         //   - bridge-путь: слушаем bridge.now() как раньше.
-        let native_path_active = self.native_engine.is_pure() && !self.reverse;
+        let native_path_active = self.native_engine.lock().map(|e| e.is_pure()).unwrap_or(false) && !self.reverse;
         if !native_path_active {
             if let Some(t) = self.bridge.now() {
                 if self.seek_ignore_now_frames > 0 {

@@ -623,6 +623,8 @@ impl ProjectAudioState {
             selected_take: None,
             muted: false,
             name: None,
+            voice_fx: None,
+            fx_source_file_id: None,
         };
         let track = self.track_mut(track_id)?;
         track.clips.push(clip);
@@ -1096,11 +1098,176 @@ pub struct AudioClip {
     pub selected_take: Option<TakeLaneId>,
     pub muted: bool,
     pub name: Option<String>,
+    /// Chaîne FX voix par clip (liste de paramètres choisie par l'utilisateur).
+    /// Les paramètres lourds (bitcrush, gate, comp…) sont rendus dans
+    /// `fx_source_file_id` ; pitch/fades/volume restent non destructifs.
+    #[serde(default)]
+    pub voice_fx: Option<ClipVoiceFx>,
+    /// Source dérivée rendue avec les FX (recalculée à chaque changement).
+    /// La source d'origine reste `source_file_id` — re-render non destructif.
+    #[serde(default)]
+    pub fx_source_file_id: Option<AudioSourceId>,
 }
 
 impl AudioClip {
     pub fn end(&self) -> f64 {
         self.timeline_position + self.length
+    }
+
+    /// Source effective à jouer/rendre : la version FX si présente.
+    pub fn effective_source_file_id(&self) -> AudioSourceId {
+        self.fx_source_file_id.unwrap_or(self.source_file_id)
+    }
+}
+
+/// Paramètres affichables dans l'éditeur de clip — liste personnalisée,
+/// ordre = celui choisi par l'utilisateur (pitch/fades/volume = live,
+/// le reste = rendu dans la source dérivée).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ClipFxParam {
+    Pitch,
+    BitcrushRate,
+    BitcrushBits,
+    Saturation,
+    CompThreshold,
+    CompRatio,
+    Highpass,
+    NoiseGate,
+    FadeIn,
+    FadeOut,
+    PitchRise,
+    PitchFall,
+    Volume,
+}
+
+pub const CLIP_FX_PARAMS_ALL: [ClipFxParam; 13] = [
+    ClipFxParam::Pitch,
+    ClipFxParam::BitcrushRate,
+    ClipFxParam::BitcrushBits,
+    ClipFxParam::Saturation,
+    ClipFxParam::CompThreshold,
+    ClipFxParam::CompRatio,
+    ClipFxParam::Highpass,
+    ClipFxParam::NoiseGate,
+    ClipFxParam::FadeIn,
+    ClipFxParam::FadeOut,
+    ClipFxParam::PitchRise,
+    ClipFxParam::PitchFall,
+    ClipFxParam::Volume,
+];
+
+/// Aucun paramètre affiché par défaut : l'utilisateur choisit les siens
+/// via « + paramètre » (la liste vient de lui, pas d'un preset).
+fn default_clip_fx_params() -> Vec<ClipFxParam> {
+    Vec::new()
+}
+
+/// Réglages FX « lourds » rendus dans la source dérivée du clip.
+/// Les valeurs par défaut reprennent le réglage voix de référence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipVoiceFx {
+    #[serde(default = "default_clip_fx_params")]
+    pub ui_params: Vec<ClipFxParam>,
+    /// Bitcrush : fréquence de ré-échantillonnage (Hz). >= sr/2 ou <=0 = bypass.
+    #[serde(default = "default_bitcrush_rate")]
+    pub bitcrush_rate_hz: f32,
+    /// Bitcrush : profondeur en bits (1..24). >= 24 ou <= 0 = bypass.
+    #[serde(default = "default_bitcrush_bits")]
+    pub bitcrush_bits: f32,
+    /// Saturation : gain d'entrée du tanh en dB (0 = off).
+    #[serde(default = "default_saturation_db")]
+    pub saturation_db: f32,
+    /// Compresseur : seuil en dB (0 = off).
+    #[serde(default = "default_comp_threshold")]
+    pub comp_threshold_db: f32,
+    /// Compresseur : ratio N:1 (<=1 = off).
+    #[serde(default = "default_comp_ratio")]
+    pub comp_ratio: f32,
+    /// Passe-haut de nettoyage (Hz, 0 = off).
+    #[serde(default = "default_highpass_hz")]
+    pub highpass_hz: f32,
+    /// Noise gate : seuil en dB (-80..0, <=-80 = off).
+    #[serde(default = "default_gate_db")]
+    pub gate_db: f32,
+    /// Montée de pitch au début en demi-tons (0 = off, ramp sur ~15% du clip).
+    #[serde(default)]
+    pub pitch_rise_semitones: f32,
+    /// Chute de pitch à la fin en demi-tons (0 = off).
+    #[serde(default)]
+    pub pitch_fall_semitones: f32,
+}
+
+fn default_bitcrush_rate() -> f32 { 9600.0 }
+fn default_bitcrush_bits() -> f32 { 8.0 }
+fn default_saturation_db() -> f32 { 6.0 }
+fn default_comp_threshold() -> f32 { -32.0 }
+fn default_comp_ratio() -> f32 { 10.0 }
+fn default_highpass_hz() -> f32 { 90.0 }
+fn default_gate_db() -> f32 { -48.0 }
+
+impl Default for ClipVoiceFx {
+    fn default() -> Self {
+        Self {
+            ui_params: default_clip_fx_params(),
+            bitcrush_rate_hz: default_bitcrush_rate(),
+            bitcrush_bits: default_bitcrush_bits(),
+            saturation_db: default_saturation_db(),
+            comp_threshold_db: default_comp_threshold(),
+            comp_ratio: default_comp_ratio(),
+            highpass_hz: default_highpass_hz(),
+            gate_db: default_gate_db(),
+            pitch_rise_semitones: 0.0,
+            pitch_fall_semitones: 0.0,
+        }
+    }
+}
+
+impl ClipVoiceFx {
+    /// Vrai si le paramètre est affiché dans le panneau — seuls les
+    /// paramètres visibles s'appliquent (la liste vient de l'utilisateur).
+    pub fn param_enabled(&self, p: ClipFxParam) -> bool {
+        self.ui_params.contains(&p)
+    }
+
+    /// Remet la valeur du paramètre à son défaut (appelé quand on le retire).
+    pub fn reset_param(&mut self, p: ClipFxParam) {
+        let d = Self::default();
+        match p {
+            ClipFxParam::BitcrushRate => self.bitcrush_rate_hz = d.bitcrush_rate_hz,
+            ClipFxParam::BitcrushBits => self.bitcrush_bits = d.bitcrush_bits,
+            ClipFxParam::Saturation => self.saturation_db = d.saturation_db,
+            ClipFxParam::CompThreshold => self.comp_threshold_db = d.comp_threshold_db,
+            ClipFxParam::CompRatio => self.comp_ratio = d.comp_ratio,
+            ClipFxParam::Highpass => self.highpass_hz = d.highpass_hz,
+            ClipFxParam::NoiseGate => self.gate_db = d.gate_db,
+            ClipFxParam::PitchRise => self.pitch_rise_semitones = 0.0,
+            ClipFxParam::PitchFall => self.pitch_fall_semitones = 0.0,
+            _ => {}
+        }
+    }
+
+    /// Un rendu n'est nécessaire que si un paramètre *affiché* sort du bypass.
+    /// Paires (bitcrush, compresseur) : afficher l'un des deux suffit,
+    /// l'autre garde son défaut.
+    pub fn needs_render(&self, source_rate: u32) -> bool {
+        let crush_on = (self.param_enabled(ClipFxParam::BitcrushRate)
+            || self.param_enabled(ClipFxParam::BitcrushBits))
+            && self.bitcrush_rate_hz > 0.0
+            && self.bitcrush_rate_hz < source_rate as f32 * 0.5
+            && self.bitcrush_bits > 0.0
+            && self.bitcrush_bits < 24.0;
+        crush_on
+            || (self.param_enabled(ClipFxParam::Saturation) && self.saturation_db > 0.05)
+            || ((self.param_enabled(ClipFxParam::CompThreshold)
+                || self.param_enabled(ClipFxParam::CompRatio))
+                && self.comp_ratio > 1.0
+                && self.comp_threshold_db < -0.05)
+            || (self.param_enabled(ClipFxParam::Highpass) && self.highpass_hz > 0.0)
+            || (self.param_enabled(ClipFxParam::NoiseGate) && self.gate_db > -79.9)
+            || (self.param_enabled(ClipFxParam::PitchRise)
+                && self.pitch_rise_semitones.abs() > 0.01)
+            || (self.param_enabled(ClipFxParam::PitchFall)
+                && self.pitch_fall_semitones.abs() > 0.01)
     }
 }
 

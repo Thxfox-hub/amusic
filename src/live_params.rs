@@ -92,6 +92,68 @@ pub fn types_in(calls: &[SoundCall], bank_category: &dyn Fn(&str) -> String) -> 
     out
 }
 
+/// Une option ajoutable à un appel `s("…")` depuis le bouton « + » de l'éditeur :
+/// le fragment est inséré sur sa propre ligne sous l'appel, avec un widget
+/// `slider(…)` inline pour ajuster la valeur en direct.
+#[derive(Debug, Clone, Copy)]
+pub struct SoundOption {
+    /// Label FR affiché dans le menu.
+    pub label: &'static str,
+    /// Fragment chaîné inséré (`.method(slider(v,min,max))…`).
+    pub code: &'static str,
+}
+
+/// Catalogue personnalisé — chaque entrée doit correspondre à un vrai
+/// paramètre superdough (sinon le contrôle serait muet). Pas de « noise gate »
+/// : inexistant dans Strudel (`.gate` = durée, pas un seuil).
+pub const SOUND_OPTIONS: &[SoundOption] = &[
+    SoundOption { label: "Pitch (demi-tons)", code: ".speed(semitones(slider(2.5,-12,12)))" },
+    SoundOption { label: "Bitcrush – fréquence", code: ".coarse(slider(5,1,96))" },
+    SoundOption { label: "Bitcrush – bits", code: ".crush(slider(8,1,16))" },
+    SoundOption { label: "Saturation", code: ".shape(slider(0.4,0,1))" },
+    SoundOption { label: "Compression – seuil", code: ".compressor(slider(-32,-60,0))" },
+    SoundOption { label: "Compression – ratio", code: ".compressor(slider(-32,-60,0)).compressorRatio(slider(10,1,20))" },
+    SoundOption { label: "Coupe-bas", code: ".hpf(slider(90,20,2000))" },
+    SoundOption { label: "Filtre passe-bas", code: ".lpf(slider(2000,200,8000))" },
+    SoundOption { label: "Crescendo début", code: ".attack(slider(0.25,0,3))" },
+    SoundOption { label: "Decrescendo fin", code: ".release(slider(0.35,0,3))" },
+    SoundOption { label: "Montée de pitch au début", code: ".penv(slider(3,-24,24)).pattack(slider(0.05,0.001,0.5))" },
+    SoundOption { label: "Chute de pitch à la fin", code: ".penv(slider(-3,-24,24)).prelease(slider(0.1,0.001,1))" },
+    SoundOption { label: "Volume", code: ".gain(slider(1,0,2))" },
+    SoundOption { label: "Panoramique", code: ".pan(slider(0,-1,1))" },
+    // Enchaînement : empêcher les voix de se chevaucher sur un son long.
+    SoundOption { label: "Une voix à la fois — espacement (cycles)", code: ".slow(slider(4,1,128))" },
+    SoundOption { label: "Une voix à la fois — couper la précédente", code: ".cut(slider(1,0,8))" },
+    SoundOption { label: "Caler le sample sur N cycles", code: ".loopAt(slider(4,1,64))" },
+];
+
+/// Point d'insertion d'une option chaînée : fin de la ligne de l'appel `s("…")`,
+/// prolongée tant que les lignes suivantes continuent la chaîne (commencent
+/// par `.`). L'option est insérée sur sa propre ligne juste après.
+pub fn chain_insert_point(code: &str, call_end: usize) -> usize {
+    let mut at = line_end(code, call_end);
+    loop {
+        let next = at + 1; // saute le '\n'
+        if next >= code.len() {
+            break;
+        }
+        let nl = line_end(code, next);
+        if code[next..nl].trim_start().starts_with('.') {
+            at = nl;
+        } else {
+            break;
+        }
+    }
+    at
+}
+
+fn line_end(code: &str, from: usize) -> usize {
+    code[from..]
+        .find('\n')
+        .map(|r| from + r)
+        .unwrap_or(code.len())
+}
+
 /// Liste les appels `s("…")` dans l'ordre du code.
 pub fn find_sound_calls(code: &str) -> Vec<SoundCall> {
     const OPEN: &str = "s(\"";
@@ -349,7 +411,14 @@ pub fn find_inline_widgets(code: &str) -> Vec<InlineWidget> {
 
 /// Réécrit la valeur d'un widget inline (span issu de `find_inline_widgets`), autres args conservés.
 pub fn set_inline_widget_value(code: &str, s: &InlineWidget, v: f32) -> String {
-    format!("{}{}{}", &code[..s.value_start], fmt_value(v), &code[s.value_end..])
+    if s.value_start > s.value_end {
+        return code.to_string();
+    }
+    let (Some(head), Some(tail)) = (code.get(..s.value_start), code.get(s.value_end..))
+    else {
+        return code.to_string();
+    };
+    format!("{}{}{}", head, fmt_value(v), tail)
 }
 
 /// Découpe `code[args..close]` (contenu d'une paire de parenthèses) en arguments au niveau 0.
@@ -591,6 +660,30 @@ mod tests {
         let s = find_inline_widgets("s(\"bd\").mask(toggler(1)) // slider(9)");
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].kind, InlineWidgetKind::Toggler);
+    }
+
+    #[test]
+    fn chain_insert_point_single_line() {
+        let code = "s(\"bd\").gain(1)\ns(\"hh\")";
+        let calls = find_sound_calls(code);
+        let at = chain_insert_point(code, calls[0].end);
+        assert_eq!(&code[..at], "s(\"bd\").gain(1)");
+    }
+
+    #[test]
+    fn chain_insert_point_extends_multiline() {
+        let code = "s(\"bd\")\n  .gain(1)\n  .lpf(400)\n\ns(\"hh\")";
+        let calls = find_sound_calls(code);
+        let at = chain_insert_point(code, calls[0].end);
+        assert_eq!(&code[..at], "s(\"bd\")\n  .gain(1)\n  .lpf(400)");
+    }
+
+    #[test]
+    fn chain_insert_point_stops_at_plain_code() {
+        let code = "s(\"bd\")\n  .gain(1)\nstack(x)";
+        let calls = find_sound_calls(code);
+        let at = chain_insert_point(code, calls[0].end);
+        assert_eq!(&code[..at], "s(\"bd\")\n  .gain(1)");
     }
 
     #[test]

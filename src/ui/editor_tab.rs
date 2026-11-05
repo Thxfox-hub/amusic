@@ -1989,8 +1989,11 @@ impl EditorTab {
                                 ui.ctx()
                                     .set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                             }
-                            let resp =
-                                resp.on_hover_text(&self.code[s.call_start..s.call_end]);
+                            // Spans calculés sur self.code : get() évite tout
+                            // slice hors-limites si le code a changé ce frame.
+                            let resp = resp.on_hover_text(
+                                self.code.get(s.call_start..s.call_end).unwrap_or(""),
+                            );
                             if resp.dragged() {
                                 if let Some(pos) = resp.interact_pointer_pos() {
                                     let t = ((pos.x - track_min_x)
@@ -2004,6 +2007,10 @@ impl EditorTab {
                                     if new_code != self.code {
                                         self.code = new_code;
                                         editor_actions.push(EditorAction::ApplyLiveCode);
+                                        // Tous les spans suivants sont périmés
+                                        // (offsets octets décalés) — la frame
+                                        // suivante recalcule la liste.
+                                        break;
                                     }
                                 }
                             }
@@ -2057,8 +2064,9 @@ impl EditorTab {
                             if resp.hovered() {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
-                            let resp =
-                                resp.on_hover_text(&self.code[s.call_start..s.call_end]);
+                            let resp = resp.on_hover_text(
+                                self.code.get(s.call_start..s.call_end).unwrap_or(""),
+                            );
                             if resp.clicked() {
                                 let new_code =
                                     crate::live_params::set_inline_widget_value(
@@ -2069,10 +2077,67 @@ impl EditorTab {
                                 if new_code != self.code {
                                     self.code = new_code;
                                     editor_actions.push(EditorAction::ApplyLiveCode);
+                                    break;
                                 }
                             }
                         }
                     }
+                }
+            }
+
+            // --- Bouton « + » après chaque s("…") : menu des options à insérer
+            // sur leur propre ligne sous l'appel (mode éditeur, la liste vient
+            // de l'utilisateur).
+            let sound_calls = crate::live_params::find_sound_calls(&self.code);
+            for call in &sound_calls {
+                let char_end = Self::byte_to_char(&self.code, call.end);
+                let end_rect = galley.pos_from_cursor(egui::text::CCursor {
+                    index: char_end,
+                    prefer_next_row: false,
+                });
+                let btn_rect = egui::Rect::from_min_max(
+                    egui::pos2(
+                        gpos.x + end_rect.min.x - SOUND_OPTION_GAP,
+                        gpos.y + end_rect.min.y,
+                    ),
+                    egui::pos2(gpos.x + end_rect.min.x, gpos.y + end_rect.max.y),
+                );
+                if btn_rect.min.y > editor_viewport_rect.max.y
+                    || btn_rect.max.y < editor_viewport_rect.min.y
+                {
+                    continue;
+                }
+                let mut chosen: Option<&'static str> = None;
+                let resp = ui.allocate_ui_at_rect(btn_rect, |ui| {
+                    // Bouton simple (pas de ComboBox) : le chrome de la combo
+                    // déborde du vide de 20px et recouvre le texte à droite.
+                    ui.add(
+                        egui::Button::new(egui::RichText::new("+").small())
+                            .min_size(egui::vec2(SOUND_OPTION_GAP, btn_rect.height())),
+                    )
+                });
+                let resp = resp.inner;
+                egui::Popup::menu(&resp).show(|ui| {
+                    ui.set_min_width(190.0);
+                    ui.label(egui::RichText::new(&call.label).weak().small());
+                    ui.separator();
+                    for opt in crate::live_params::SOUND_OPTIONS {
+                        if ui.selectable_label(false, opt.label).clicked() {
+                            chosen = Some(opt.code);
+                            egui::Popup::close_id(ui.ctx(), resp.id);
+                        }
+                    }
+                });
+                if let Some(code) = chosen {
+                    let at = crate::live_params::chain_insert_point(&self.code, call.end)
+                        .min(self.code.len());
+                    let tail = self.code.split_off(at);
+                    self.code.push_str("\n  ");
+                    self.code.push_str(code);
+                    self.code.push_str(&tail);
+                    editor_actions.push(EditorAction::ApplyLiveCode);
+                    // Positions des appels suivants décalées — on recalcule.
+                    break;
                 }
             }
 
@@ -2896,18 +2961,30 @@ fn inline_widget_gap(kind: crate::live_params::InlineWidgetKind) -> f32 {
 /// le widget y est dessiné et la valeur reste affichée en texte juste à côté
 /// (comme sur strudel.cc). La suite du texte est décalée : le widget prend une
 /// place réelle dans la ligne.
+/// Largeur du bouton « + » réservé après chaque appel `s("…")`.
+const SOUND_OPTION_GAP: f32 = 20.0;
+
 fn inject_inline_slider_gaps(job: &mut egui::text::LayoutJob, text: &str) {
-    use crate::live_params::find_inline_widgets;
+    use crate::live_params::{find_inline_widgets, find_sound_calls};
     let widgets = find_inline_widgets(text);
-    if widgets.is_empty() {
+    let calls = find_sound_calls(text);
+    if widgets.is_empty() && calls.is_empty() {
         return;
     }
-    let mut cuts: Vec<usize> = Vec::with_capacity(widgets.len() * 2);
-    let mut value_spans: Vec<(usize, usize, f32)> = Vec::with_capacity(widgets.len());
+    let mut cuts: Vec<usize> = Vec::with_capacity(widgets.len() * 2 + calls.len());
+    let mut value_spans: Vec<(usize, usize, f32)> =
+        Vec::with_capacity(widgets.len() + calls.len());
     for s in &widgets {
         cuts.push(s.value_start);
         cuts.push(s.value_end);
         value_spans.push((s.value_start, s.value_end, inline_widget_gap(s.kind)));
+    }
+    // Un vide juste après le `)` de chaque `s("…")` : le bouton « + option »
+    // s'y dessine (voir l'overlay plus bas).
+    for c in &calls {
+        cuts.push(c.end);
+        cuts.push(c.end);
+        value_spans.push((c.end, c.end, SOUND_OPTION_GAP));
     }
     cuts.sort_unstable();
     cuts.dedup();

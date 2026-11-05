@@ -19,13 +19,22 @@ use serde_json::{json, Value};
 use tiny_http::{Method, Response, Server, StatusCode};
 
 pub const CONTROL_PORT: u16 = 9878;
-const RESPONSE_WAIT: Duration = Duration::from_secs(8);
+const RESPONSE_WAIT: Duration = Duration::from_secs(3);
+/// Au-delà de ce délai sans `update()`, l'UI est considérée gelée — en pratique :
+/// fenêtre occluse (autre workspace) → Wayland suspend les frame callbacks →
+/// la boucle eframe se fige. Les actions écriture sont alors rejetées vite au
+/// lieu d'attendre un timeout, et les lectures répondent depuis le snapshot.
+const UI_STALE_MS: u64 = 2500;
 
 /// Une requête d'un client HTTP, exécutée par le thread UI.
 pub struct ControlRequest {
     pub id: u64,
     /// Corps JSON de la requête (`{"action": "...", ...}`).
     pub body: Value,
+    /// Instant de mise en file : une requête trop vieille est jetée sans être
+    /// exécutée — sinon un gel UI long déclencherait une rafale d'actions
+    /// périmées au dégel.
+    pub queued_at: Instant,
 }
 
 struct Shared {
@@ -36,6 +45,8 @@ struct Shared {
     /// Contexte egui pour réveiller le thread UI quand une requête arrive :
     /// sans repaint, `update()` n'est jamais appelée et la file resterait pleine.
     wakeup: Option<egui::Context>,
+    /// Heartbeat du thread UI (epoch millis, alimenté à chaque `update()`).
+    heartbeat: Option<Arc<AtomicU64>>,
 }
 
 /// Handle clonable détenu par l'app : dépile les requêtes, publie le statut.
@@ -56,6 +67,7 @@ impl ControlApi {
                 status: json!({"ok": false, "error": "status not published yet"}),
                 started_at: Instant::now(),
                 wakeup: None,
+                heartbeat: None,
             })),
             next_id: Arc::new(AtomicU64::new(1)),
         };
@@ -76,10 +88,24 @@ impl ControlApi {
         api
     }
 
+    /// Branche le heartbeat du watchdog UI (epoch millis à chaque `update()`).
+    pub fn set_heartbeat(&self, heartbeat: Arc<AtomicU64>) {
+        if let Ok(mut s) = self.shared.lock() {
+            s.heartbeat = Some(heartbeat);
+        }
+    }
+
     /// Vide la file des requêtes en attente (appelé par le thread UI).
+    /// Les requêtes plus vieilles que `UI_STALE_MS` sont jetées : leur client a
+    /// déjà eu un timeout, et les exécuter déclencherait des actions périmées.
     pub fn take_requests(&self) -> Vec<ControlRequest> {
         match self.shared.lock() {
-            Ok(mut s) => s.queue.drain(..).collect(),
+            Ok(mut s) => {
+                let now = Instant::now();
+                s.queue
+                    .retain(|r| now.duration_since(r.queued_at) < Duration::from_millis(UI_STALE_MS));
+                s.queue.drain(..).collect()
+            }
             Err(_) => Vec::new(),
         }
     }
@@ -146,20 +172,72 @@ fn serve(server: Server, shared: Arc<Mutex<Shared>>, next_id: Arc<AtomicU64>) {
     }
 }
 
+/// Âge du heartbeat UI en millisecondes (None = heartbeat non branché → sain).
+fn ui_stale_ms(shared: &Arc<Mutex<Shared>>) -> Option<u64> {
+    let s = shared.lock().ok()?;
+    let beat = s.heartbeat.as_ref()?.load(Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Some(now.saturating_sub(beat))
+}
+
 /// Met la requête en file et attend que le thread UI produise la réponse.
+/// Deux courts-circuits : les lectures (`ping`, `get_status`) sont servies
+/// directement depuis le snapshot — elles répondent même si la boucle UI est
+/// figée (fenêtre occluse) — et les écritures sont rejetées vite quand l'UI
+/// est figée, au lieu de s'empiler pour rien jusqu'au timeout.
 fn dispatch(body: Value, shared: &Arc<Mutex<Shared>>, next_id: &Arc<AtomicU64>) -> Response<Cursor<Vec<u8>>> {
+    let action = body.get("action").and_then(|a| a.as_str()).unwrap_or("");
+    let stale_ms = ui_stale_ms(shared);
+    let ui_paused = stale_ms.is_some_and(|ms| ms > UI_STALE_MS);
+    match action {
+        "ping" => {
+            return json_ok(json!({
+                "ok": true, "app": "struidel",
+                "ui_paused": ui_paused,
+                "ui_stale_ms": stale_ms,
+            }));
+        }
+        "get_status" => {
+            let mut status = shared
+                .lock()
+                .map(|s| s.status.clone())
+                .unwrap_or_else(|_| json!({"ok": false}));
+            if let Some(obj) = status.as_object_mut() {
+                obj.insert("ui_paused".into(), json!(ui_paused));
+                if let Some(ms) = stale_ms {
+                    obj.insert("ui_stale_ms".into(), json!(ms));
+                }
+                if ui_paused {
+                    obj.insert(
+                        "hint".into(),
+                        json!("interface en pause — la fenêtre struIDEl est occluse (autre workspace) ; affiche-la ou épingle-la"),
+                    );
+                }
+            }
+            return json_ok(status);
+        }
+        _ => {}
+    }
     let id = next_id.fetch_add(1, Ordering::Relaxed);
     {
         let Ok(mut s) = shared.lock() else {
             return json_err("control queue lock poisoned");
         };
-        s.queue.push_back(ControlRequest { id, body });
+        s.queue.push_back(ControlRequest {
+            id,
+            body,
+            queued_at: Instant::now(),
+        });
         // Réveille l'UI : sinon update() n'est pas rappelée et la requête attend.
         if let Some(ctx) = &s.wakeup {
             ctx.request_repaint();
         }
     }
-    let deadline = Instant::now() + RESPONSE_WAIT;
+    let start = Instant::now();
+    let deadline = start + RESPONSE_WAIT;
     loop {
         {
             if let Ok(mut s) = shared.lock() {
@@ -167,6 +245,18 @@ fn dispatch(body: Value, shared: &Arc<Mutex<Shared>>, next_id: &Arc<AtomicU64>) 
                     return json_ok(resp);
                 }
             }
+        }
+        // Heartbeat gelé pendant l'attente → la boucle UI ne tourne pas
+        // (fenêtre occluse) : répondre honnêtement au lieu d'attendre.
+        // Délai de grâce 600 ms : une app idle visible est parquée (heartbeat
+        // périmé) mais le wakeup la réveille en ~10 ms — ne pas la condamner
+        // avant qu'elle ait eu sa chance.
+        if Instant::now().duration_since(start) > Duration::from_millis(600)
+            && ui_stale_ms(shared).is_some_and(|ms| ms > UI_STALE_MS)
+        {
+            return json_err(
+                "interface en pause : la fenêtre struIDEl est occluse — affiche-la (workspace) ou épingle-la pour réactiver l'API",
+            );
         }
         if Instant::now() >= deadline {
             return json_err("timeout: l'application n'a pas répondu");
